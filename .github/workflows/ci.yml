@@ -98,7 +98,7 @@ jobs:
           curl -sSL https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz \
             | sudo tar -xz -C /usr/local/bin gitleaks
       - name: Run gitleaks
-        run: gitleaks detect --source=. --verbose --redact --no-banner --exit-code=1
+        run: gitleaks detect --source=. --config=.gitleaks.toml --verbose --redact --no-banner --exit-code=1
 
   codeql:
     name: CodeQL (Python)

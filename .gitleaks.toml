@@ -1,0 +1,13 @@
+title = "AITerm gitleaks config"
+
+# Inherit default rules
+[extend]
+useDefault = true
+
+# Allowlist: MANIFEST_PUBKEY_HEX is a public key by design (Ed25519 verification key
+# embedded in installer + connector). Publishing it is the point.
+[[allowlists]]
+description = "Ed25519 public key — meant to be published"
+regexes = [
+  '''MANIFEST_PUBKEY_HEX\s*=\s*"[0-9a-f]{64}"''',
+]
