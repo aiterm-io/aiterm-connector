@@ -116,7 +116,11 @@ print(f\"  Dir:   $DIR\")
     ;;
   logs)
     if [ "$SVC_WORKS" -eq 1 ]; then
-      journalctl $( [ "$SVC" != "systemctl" ] && echo "--user" ) -u aiterm-connector -u aiterm-pty --no-pager -n "${2:-30}"
+      if [ "$SVC" != "systemctl" ]; then
+        journalctl --user -u aiterm-connector -u aiterm-pty --no-pager -n "${2:-30}"
+      else
+        journalctl -u aiterm-connector -u aiterm-pty --no-pager -n "${2:-30}"
+      fi
     elif [ -f "$DIR/connector.log" ]; then
       tail -n "${2:-30}" "$DIR/connector.log"
     else

@@ -41,10 +41,8 @@ setup_user_mode() {
     RUN_AS="$TARGET_USER"
     if [ "$(id -u)" -eq 0 ] && [ "$TARGET_USER" != "root" ]; then
         SVC_CMD="sudo -u $TARGET_USER XDG_RUNTIME_DIR=/run/user/$(id -u $TARGET_USER) systemctl --user"
-        RUN_CMD="sudo -u $TARGET_USER"
     else
         SVC_CMD="systemctl --user"
-        RUN_CMD=""
     fi
     mkdir -p "$BIN_DIR" "$INSTALL_DIR"
     if [ "$(id -u)" -eq 0 ] && [ "$TARGET_USER" != "root" ]; then chown -R "$TARGET_USER:" "$INSTALL_DIR" "$BIN_DIR" 2>/dev/null; fi
@@ -247,12 +245,10 @@ if [ -f "$INSTALL_DIR/connector.json" ] && [ -f "$INSTALL_DIR/connector.py" ]; t
     fi
 
     # Systemd units (rewrites if outdated — picks up hardening + path changes)
-    UNIT_RELOAD=0
     if command -v systemctl &>/dev/null && [ -d /etc/systemd/system ] || [ -d "$HOME/.config/systemd/user" ]; then
         write_units
         if [ "$PTY_UNIT_CHANGED" = "1" ] || [ "$CONN_UNIT_CHANGED" = "1" ]; then
             $SVC_CMD daemon-reload 2>/dev/null
-            UNIT_RELOAD=1
             ok "Systemd unit files updated"
             [ "$PTY_UNIT_CHANGED" = "1" ] && PTY_CHANGED=1
             [ "$CONN_UNIT_CHANGED" = "1" ] && CONN_CHANGED=1
