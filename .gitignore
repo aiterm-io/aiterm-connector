@@ -1,0 +1,24 @@
+# Runtime state — never commit
+connector.json
+connector.log
+connector.lock
+pty.sock
+.cert_pin
+uploads/
+
+# Signing material — must stay private
+manifest_signing_key
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp

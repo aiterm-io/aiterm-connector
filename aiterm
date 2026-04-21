@@ -1,0 +1,172 @@
+#!/bin/bash
+# AITerm Connector CLI
+PY="/usr/bin/python3"
+
+# Auto-detect install location
+if [ -d "/opt/aiterm" ] && [ -f "/opt/aiterm/connector.py" ]; then
+    DIR="/opt/aiterm"
+    SVC="systemctl"
+elif [ -d "$HOME/.local/share/aiterm" ] && [ -f "$HOME/.local/share/aiterm/connector.py" ]; then
+    DIR="$HOME/.local/share/aiterm"
+    SVC="systemctl --user"
+else
+    echo "  AITerm not found. Install:"
+    echo "  curl -sL https://aiterm.io/install | bash"
+    exit 1
+fi
+
+# Check if systemctl works (user mode may not have D-Bus session)
+SVC_WORKS=1
+if [ "$SVC" = "systemctl --user" ]; then
+    $SVC is-system-running &>/dev/null || SVC_WORKS=0
+fi
+
+case "${1:-}" in
+  update)   exec $PY "$DIR/connector.py" --update ;;
+  scan)     exec $PY "$DIR/connector.py" --scan ;;
+  status)
+    echo ""
+    if [ "$SVC_WORKS" -eq 1 ]; then
+      for svc in aiterm-connector aiterm-pty; do
+        STATE=$($SVC is-active $svc 2>/dev/null || echo "not running")
+        if [ "$STATE" = "active" ]; then
+          echo -e "  \033[0;32m●\033[0m $svc"
+        else
+          echo -e "  \033[0;31m●\033[0m $svc ($STATE)"
+        fi
+      done
+    else
+      if pgrep -f "python3.*$DIR/pty-manager.py" &>/dev/null; then
+        echo -e "  \033[0;32m●\033[0m pty-manager"
+      else
+        echo -e "  \033[0;31m●\033[0m pty-manager (not running)"
+      fi
+      if pgrep -f "python3.*$DIR/connector.py" &>/dev/null; then
+        echo -e "  \033[0;32m●\033[0m connector"
+      else
+        echo -e "  \033[0;31m●\033[0m connector (not running)"
+      fi
+    fi
+    echo ""
+    if [ -f "$DIR/connector.json" ]; then
+      $PY -c "
+import json
+c=json.load(open('$DIR/connector.json'))
+print(f\"  Host:  {c.get('name','?')}\")
+print(f\"  Hub:   {c.get('hub_url','?')}\")
+print(f\"  Dir:   $DIR\")
+"
+      echo ""
+    fi
+    ;;
+  start)
+    if pgrep -f "python3.*$DIR/connector.py" &>/dev/null; then
+      echo -e "  \033[0;33m!\033[0m Connector already running."
+      echo "  Use 'aiterm restart' to restart."
+    elif [ "$SVC_WORKS" -eq 1 ]; then
+      $SVC start aiterm-pty aiterm-connector 2>/dev/null && echo "  Started." || {
+        echo "  Service start failed. Starting manually..."
+        nohup $PY "$DIR/pty-manager.py" >> "$DIR/connector.log" 2>&1 &
+        sleep 1
+        nohup $PY "$DIR/connector.py" >> "$DIR/connector.log" 2>&1 &
+        echo -e "  \033[0;32m●\033[0m Started"
+      }
+    else
+      # Manual mode: start PTY manager first, then connector
+      if ! pgrep -f "python3.*$DIR/pty-manager.py" &>/dev/null; then
+        nohup $PY "$DIR/pty-manager.py" >> "$DIR/connector.log" 2>&1 &
+        sleep 1
+      fi
+      nohup $PY "$DIR/connector.py" >> "$DIR/connector.log" 2>&1 &
+      echo -e "  \033[0;32m●\033[0m Started (PTY manager + connector)"
+      echo "  Logs: aiterm logs"
+    fi
+    ;;
+  stop)
+    if [ "$SVC_WORKS" -eq 1 ]; then
+      $SVC stop aiterm-connector aiterm-pty 2>/dev/null
+    fi
+    pkill -f "python3.*$DIR/connector.py" 2>/dev/null
+    pkill -f "python3.*$DIR/pty-manager.py" 2>/dev/null
+    rm -f "$DIR/connector.lock" "$DIR/pty.sock" 2>/dev/null
+    echo "  Stopped."
+    ;;
+  restart)
+    if [ "$SVC_WORKS" -eq 1 ]; then
+      $SVC restart aiterm-pty aiterm-connector 2>/dev/null && echo "  Restarted." || {
+        pkill -f "python3.*$DIR/connector.py" 2>/dev/null
+        pkill -f "python3.*$DIR/pty-manager.py" 2>/dev/null
+        rm -f "$DIR/pty.sock" 2>/dev/null
+        sleep 1
+        nohup $PY "$DIR/pty-manager.py" >> "$DIR/connector.log" 2>&1 &
+        sleep 1
+        nohup $PY "$DIR/connector.py" >> "$DIR/connector.log" 2>&1 &
+        echo -e "  \033[0;32m●\033[0m Restarted"
+      }
+    else
+      pkill -f "python3.*$DIR/connector.py" 2>/dev/null
+      pkill -f "python3.*$DIR/pty-manager.py" 2>/dev/null
+      rm -f "$DIR/pty.sock" 2>/dev/null
+      sleep 1
+      nohup $PY "$DIR/pty-manager.py" >> "$DIR/connector.log" 2>&1 &
+      sleep 1
+      nohup $PY "$DIR/connector.py" >> "$DIR/connector.log" 2>&1 &
+      echo -e "  \033[0;32m●\033[0m Restarted (PTY manager + connector)"
+    fi
+    ;;
+  logs)
+    if [ "$SVC_WORKS" -eq 1 ]; then
+      journalctl $( [ "$SVC" != "systemctl" ] && echo "--user" ) -u aiterm-connector -u aiterm-pty --no-pager -n "${2:-30}"
+    elif [ -f "$DIR/connector.log" ]; then
+      tail -n "${2:-30}" "$DIR/connector.log"
+    else
+      echo "  No logs found."
+    fi
+    ;;
+  uninstall)
+    echo ""
+    echo -e "  \033[0;31mUninstall AITerm Connector\033[0m"
+    echo ""
+    if [ "${2:-}" != "--yes" ]; then
+      echo -n "  Are you sure? (y/N) "
+      read -r CONFIRM < /dev/tty
+      [ "$CONFIRM" != "y" ] && [ "$CONFIRM" != "Y" ] && echo "  Cancelled." && exit 0
+    fi
+    echo ""
+    if [ "$SVC_WORKS" -eq 1 ]; then
+      $SVC stop aiterm-connector aiterm-pty 2>/dev/null
+      $SVC disable aiterm-connector aiterm-pty 2>/dev/null
+    fi
+    pkill -f "python3.*$DIR/connector.py" 2>/dev/null
+    if [ "$SVC" = "systemctl" ]; then
+      rm -f /etc/systemd/system/aiterm-connector.service /etc/systemd/system/aiterm-pty.service
+      systemctl daemon-reload 2>/dev/null
+    else
+      rm -f "$HOME/.config/systemd/user/aiterm-connector.service" "$HOME/.config/systemd/user/aiterm-pty.service" 2>/dev/null
+      $SVC daemon-reload 2>/dev/null
+    fi
+    echo -e "  \033[0;32m✓\033[0m Services removed"
+    rm -rf "$DIR"
+    echo -e "  \033[0;32m✓\033[0m $DIR removed"
+    rm -f "$HOME/.local/bin/aiterm" /usr/local/bin/aiterm 2>/dev/null
+    echo -e "  \033[0;32m✓\033[0m CLI removed"
+    echo ""
+    echo "  AITerm Connector has been completely removed."
+    echo ""
+    ;;
+  *)
+    echo ""
+    echo "  AITerm Connector"
+    echo ""
+    echo "  aiterm status      Show connection status"
+    echo "  aiterm start       Start connector"
+    echo "  aiterm stop        Stop connector"
+    echo "  aiterm restart     Restart connector"
+    echo "  aiterm update      Update connector from server"
+    echo "  aiterm scan        Scan for AI backends"
+    echo "  aiterm logs        Show recent logs"
+    echo "  aiterm logs 100    Show last 100 log entries"
+    echo "  aiterm uninstall   Remove connector completely"
+    echo ""
+    ;;
+esac
