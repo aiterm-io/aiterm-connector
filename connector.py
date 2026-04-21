@@ -26,7 +26,6 @@ import json
 import logging
 import os
 import platform
-import secrets
 import shutil
 import signal
 import subprocess
@@ -202,16 +201,10 @@ def print_scan(info):
 def load_config():
     info = scan()
     defaults = {
-        "host": "0.0.0.0",
-        "port": 1026,
-        "password": secrets.token_urlsafe(16),
-        "claude_path": info["claude_path"] or "claude",
         "default_cwd": info["default_cwd"],
         "max_upload_mb": 20,
         "upload_dir": str(BASE_DIR / "uploads"),
         "name": info["hostname"],
-        "tls_cert": "",
-        "tls_key": "",
     }
     if CONFIG_PATH.exists():
         with open(CONFIG_PATH) as f:

@@ -477,20 +477,15 @@ ok "Pairing confirmed!"
 DEFAULT_CWD=$(eval echo ~)
 
 python3 - "$INSTALL_DIR" "$HUB_URL" "$TOKEN" "$DEFAULT_CWD" "$HOSTNAME" << 'PYCFG'
-import json, secrets, sys
+import json, sys, os
 install_dir, hub_url, token, default_cwd, hostname = sys.argv[1:6]
 cfg = {
-    "host": "0.0.0.0",
-    "port": 1026,
-    "password": secrets.token_urlsafe(16),
     "default_cwd": default_cwd,
     "max_upload_mb": 20,
     "upload_dir": install_dir + "/uploads",
     "name": hostname,
     "hub_url": hub_url,
     "hub_token": token,
-    "tls_cert": "",
-    "tls_key": "",
 }
 import stat
 cfg_path = install_dir + "/connector.json"
