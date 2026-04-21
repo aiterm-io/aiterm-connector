@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/aiterm-io/aiterm-connector/security/policy
+    about: Do not open a public issue — email security@aiterm.io
+  - name: Questions & discussions
+    url: https://github.com/aiterm-io/aiterm-connector/discussions
+    about: Ask in Discussions for general usage questions

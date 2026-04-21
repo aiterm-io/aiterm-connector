@@ -1,5 +1,10 @@
 # AITerm Connector
 
+[![CI](https://github.com/aiterm-io/aiterm-connector/actions/workflows/ci.yml/badge.svg)](https://github.com/aiterm-io/aiterm-connector/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/)
+[![GitHub release](https://img.shields.io/github/v/release/aiterm-io/aiterm-connector?include_prereleases&sort=semver)](https://github.com/aiterm-io/aiterm-connector/releases)
+
 Lightweight remote agent for [AITerm](https://aiterm.io) — a multi-AI terminal SaaS platform. This connector runs on your machines and relays terminal sessions to the AITerm hub so you can reach your AI backends from a browser.
 
 The connector is **MIT-licensed and fully auditable**. The hub (backend, dashboard, billing) is closed source.

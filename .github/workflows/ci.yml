@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-python:
+    name: Python syntax + lint
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.9', '3.10', '3.11', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Compile check
+        run: |
+          python -m py_compile connector.py
+          python -m py_compile pty-manager.py
+      - name: Install ruff
+        run: pip install --quiet ruff
+      - name: Ruff lint
+        run: ruff check --select=E,F,W,B --ignore=E501,E402 connector.py pty-manager.py
+
+  lint-shell:
+    name: Shell lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: ShellCheck install.sh
+        uses: ludeeus/action-shellcheck@master
+        with:
+          scandir: '.'
+          severity: warning
+      - name: Syntax check aiterm CLI
+        run: bash -n aiterm
+
+  verify-license:
+    name: License + README present
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Required files
+        run: |
+          test -f LICENSE || (echo "LICENSE missing" && exit 1)
+          test -f README.md || (echo "README.md missing" && exit 1)
+          test -f SECURITY.md || (echo "SECURITY.md missing" && exit 1)
+          grep -q "MIT License" LICENSE
