@@ -237,7 +237,7 @@ def find_binary(ai_type):
 
 async def handle_client(reader, writer):
     """Handle a connector connection."""
-    log.info(f"Connector attached")
+    log.info("Connector attached")
 
     # Register this writer with all existing sessions (for output broadcast)
     for sess in sessions.values():

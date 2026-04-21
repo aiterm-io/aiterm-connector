@@ -7,7 +7,6 @@ Lightweight remote agent. Connects outbound to the AITerm Hub.
 Usage:
     python3 connector.py              # Start
     python3 connector.py --scan       # Scan for AI backends
-    python3 connector.py --install    # Create systemd service
     python3 connector.py --update     # Self-update from server and restart
 
 Requires: pip3 install websockets
@@ -242,8 +241,6 @@ def load_config():
 # ─── Imports that need websockets ─────────────────────────────
 try:
     import websockets
-    from websockets.http11 import Response
-    from websockets.datastructures import Headers
 except ImportError:
     if "--scan" not in sys.argv:
         print("ERROR: websockets not installed. Run: pip3 install websockets")
@@ -396,20 +393,20 @@ async def push_to_hub(config):
                     except (asyncio.TimeoutError, Exception):
                         pass
 
-                # PTY → Hub relay task
-                async def pty_to_hub():
-                    if not pty_reader:
+                # PTY → Hub relay task (explicit params avoid closure-over-loop-variable)
+                async def pty_to_hub(reader, sock):
+                    if not reader:
                         return
                     try:
                         while True:
-                            line = await pty_reader.readline()
+                            line = await reader.readline()
                             if not line:
                                 break
-                            await ws.send(line.decode().rstrip("\n"))
+                            await sock.send(line.decode().rstrip("\n"))
                     except (asyncio.CancelledError, ConnectionResetError):
                         pass
 
-                relay_task = asyncio.create_task(pty_to_hub())
+                relay_task = asyncio.create_task(pty_to_hub(pty_reader, ws))
 
                 try:
                     async for raw in ws:
@@ -592,7 +589,7 @@ def self_update():
     ctx = ssl.create_default_context()
 
     # Download manifest + Ed25519 signature; verify before trusting any hash.
-    print(f"\n  AITerm Connector Update\n")
+    print("\n  AITerm Connector Update\n")
     manifest_bytes = b""
     sig_hex = ""
     try:
@@ -611,12 +608,12 @@ def self_update():
         pubkey = Ed25519PublicKey.from_public_bytes(bytes.fromhex(MANIFEST_PUBKEY_HEX))
         pubkey.verify(bytes.fromhex(sig_hex), manifest_bytes)
     except ImportError:
-        print(f"  \033[0;31m✗\033[0m cryptography module required for signature verification")
+        print("  \033[0;31m✗\033[0m cryptography module required for signature verification")
         return 1
     except Exception:
-        print(f"  \033[0;31m✗\033[0m MANIFEST SIGNATURE INVALID — update rejected")
+        print("  \033[0;31m✗\033[0m MANIFEST SIGNATURE INVALID — update rejected")
         return 1
-    print(f"  \033[0;32m✓\033[0m Manifest signature verified")
+    print("  \033[0;32m✓\033[0m Manifest signature verified")
 
     try:
         manifest = json.loads(manifest_bytes)
@@ -625,7 +622,7 @@ def self_update():
         return 1
 
     if not manifest:
-        print(f"  \033[0;31m✗\033[0m Empty manifest — aborting")
+        print("  \033[0;31m✗\033[0m Empty manifest — aborting")
         return 1
 
     # Detect bin dir
@@ -685,7 +682,7 @@ def self_update():
         except Exception:
             pass
 
-    print(f"\n  Fertig.\n")
+    print("\n  Fertig.\n")
     return 0
 
 
@@ -693,8 +690,6 @@ if __name__ == "__main__":
     if "--scan" in sys.argv:
         print_scan(scan())
         sys.exit(0)
-    if "--install" in sys.argv:
-        sys.exit(install_service())
     if "--update" in sys.argv:
         sys.exit(self_update())
     asyncio.run(main())
