@@ -459,12 +459,18 @@ async def push_to_hub(config):
                             if ext not in ALLOWED_EXT:
                                 await ws.send(json.dumps({"t": "err", "m": f"Type '{ext}' not allowed"}))
                                 continue
+                            # Pre-check encoded length to avoid decoding multi-GB payloads into RAM.
+                            b64_data = msg.get("d", "")
+                            max_bytes = config["max_upload_mb"] * 1024 * 1024
+                            if len(b64_data) > max_bytes * 4 // 3 + 8:
+                                await ws.send(json.dumps({"t": "err", "m": f"Max {config['max_upload_mb']}MB"}))
+                                continue
                             try:
-                                file_bytes = base64.b64decode(msg["d"])
+                                file_bytes = base64.b64decode(b64_data)
                             except Exception:
                                 await ws.send(json.dumps({"t": "err", "m": "Invalid data"}))
                                 continue
-                            if len(file_bytes) > config["max_upload_mb"] * 1024 * 1024:
+                            if len(file_bytes) > max_bytes:
                                 await ws.send(json.dumps({"t": "err", "m": f"Max {config['max_upload_mb']}MB"}))
                                 continue
                             if upload_dir.is_symlink() or not upload_dir.is_dir():
@@ -475,9 +481,11 @@ async def push_to_hub(config):
                             fpath = upload_dir / fname
                             # O_NOFOLLOW: reject if fname is an existing symlink
                             # O_EXCL: reject if fname already exists (no silent overwrite)
+                            # Mode 0600: uploads readable only by connector user (defense against
+                            # local unprivileged users on multi-user hosts).
                             flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
                             try:
-                                fd = os.open(str(fpath), flags, 0o644)
+                                fd = os.open(str(fpath), flags, 0o600)
                             except OSError as e:
                                 await ws.send(json.dumps({"t": "err", "m": f"upload rejected: {e.strerror}"}))
                                 continue
@@ -524,6 +532,11 @@ async def main():
     config = load_config()
     upload_dir = Path(config["upload_dir"])
     upload_dir.mkdir(parents=True, exist_ok=True)
+    # Restrict to connector user — uploads may contain sensitive files
+    try:
+        os.chmod(str(upload_dir), 0o700)
+    except OSError:
+        pass
 
     # Lock file — only one instance
     lock_path = Path(config.get("upload_dir", "/opt/aiterm")).parent / "connector.lock"

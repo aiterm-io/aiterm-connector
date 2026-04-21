@@ -168,6 +168,88 @@ SVCEOF
     [ "$CONN_OLD" != "$CONN_NEW" ] && CONN_UNIT_CHANGED=1
 }
 
+# Signed-download helper. Verifies Ed25519-signed manifest + per-file SHA-256
+# against an embedded public key. Prevents a compromised CDN/TLS endpoint from
+# shipping malicious code during first install OR update.
+# Requires python3 + cryptography (must be installed BEFORE calling this).
+signed_download() {
+    python3 - "$API_URL" "$INSTALL_DIR" "$BIN_DIR" << 'PYEOF'
+import hashlib, json, os, ssl, sys, urllib.request
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+MANIFEST_PUBKEY_HEX = "bc5e9a344e32ec65e490d725f911b8f94c5e8b17812a617da776e8ac837f2aca"
+api_url, install_dir, bin_dir = sys.argv[1:4]
+
+FILES = [
+    ("connector.py",   f"{install_dir}/connector.py"),
+    ("pty-manager.py", f"{install_dir}/pty-manager.py"),
+    ("aiterm",         f"{bin_dir}/aiterm"),
+]
+
+ctx = ssl.create_default_context()
+def fetch(path):
+    with urllib.request.urlopen(f"{api_url}/dl/{path}", context=ctx, timeout=20) as r:
+        return r.read()
+
+try:
+    manifest_bytes = fetch("manifest.json")
+    sig_hex = fetch("manifest.sig").decode().strip()
+except Exception as e:
+    print(f"FETCH FAIL: {e}", file=sys.stderr); sys.exit(1)
+
+try:
+    pub = Ed25519PublicKey.from_public_bytes(bytes.fromhex(MANIFEST_PUBKEY_HEX))
+    pub.verify(bytes.fromhex(sig_hex), manifest_bytes)
+except Exception:
+    print("MANIFEST SIGNATURE INVALID - install aborted", file=sys.stderr); sys.exit(2)
+
+try:
+    manifest = json.loads(manifest_bytes)
+except Exception as e:
+    print(f"MANIFEST MALFORMED: {e}", file=sys.stderr); sys.exit(3)
+
+for fname, target in FILES:
+    expected = manifest.get(fname)
+    if not expected:
+        print(f"{fname}: not listed in signed manifest", file=sys.stderr); sys.exit(4)
+    try:
+        data = fetch(fname)
+    except Exception as e:
+        print(f"{fname}: download failed: {e}", file=sys.stderr); sys.exit(5)
+    actual = hashlib.sha256(data).hexdigest()
+    if actual != expected:
+        print(f"{fname}: HASH MISMATCH (expected {expected[:16]}, got {actual[:16]})", file=sys.stderr); sys.exit(6)
+    os.makedirs(os.path.dirname(target) or '.', exist_ok=True)
+    with open(target, "wb") as f:
+        f.write(data)
+    os.chmod(target, 0o755)
+    print(f"    {fname}: verified ({len(data)} bytes)")
+PYEOF
+    local rc=$?
+    if [ $rc -ne 0 ]; then
+        fail "Signature/hash verification failed (rc=$rc) - no files were installed"
+    fi
+}
+
+ensure_python_deps() {
+    # Required BEFORE signed_download can run.
+    command -v python3 >/dev/null 2>&1 || {
+        if [ "$MODE" = "system" ]; then
+            apt-get update -qq && apt-get install -y -qq python3 2>/dev/null || fail "python3 not available"
+        else
+            fail "python3 required; install it first (e.g. sudo apt install python3)"
+        fi
+    }
+    python3 -c "import websockets" 2>/dev/null || \
+        python3 -m pip install --quiet --break-system-packages websockets 2>/dev/null || \
+        pip3 install --quiet --break-system-packages websockets 2>/dev/null || \
+        fail "websockets install failed"
+    python3 -c "from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey" 2>/dev/null || \
+        python3 -m pip install --quiet --break-system-packages cryptography 2>/dev/null || \
+        pip3 install --quiet --break-system-packages cryptography 2>/dev/null || \
+        fail "cryptography install failed (required for signed-update verification)"
+}
+
 # Check for existing installations first
 EXISTING_SYSTEM=0; EXISTING_USER=0
 [ -f "/opt/aiterm/connector.json" ] && EXISTING_SYSTEM=1
@@ -223,11 +305,10 @@ if [ -f "$INSTALL_DIR/connector.json" ] && [ -f "$INSTALL_DIR/connector.py" ]; t
     PTY_OLD=$(md5sum "$INSTALL_DIR/pty-manager.py" 2>/dev/null | awk '{print $1}')
     CONN_OLD=$(md5sum "$INSTALL_DIR/connector.py" 2>/dev/null | awk '{print $1}')
 
-    curl -sSL "${API_URL}/dl/connector.py" -o "$INSTALL_DIR/connector.py" || fail "Download failed"
-    curl -sSL "${API_URL}/dl/pty-manager.py" -o "$INSTALL_DIR/pty-manager.py" || fail "Download failed"
-    curl -sSL "${API_URL}/dl/aiterm" -o "$BIN_DIR/aiterm" || fail "Download failed"
-    chmod +x "$INSTALL_DIR/connector.py" "$INSTALL_DIR/pty-manager.py" "$BIN_DIR/aiterm"
-    ok "Files updated"
+    ensure_python_deps
+    info "Downloading + verifying signed manifest..."
+    signed_download
+    ok "Files updated (Ed25519 signature + SHA-256 verified)"
     [ "$BIN_DIR" != "/usr/local/bin" ] && ensure_path "$BIN_DIR"
 
     PTY_NEW=$(md5sum "$INSTALL_DIR/pty-manager.py" 2>/dev/null | awk '{print $1}')
@@ -322,29 +403,17 @@ if ! command -v python3 &>/dev/null; then
 fi
 ok "Python3"
 
-if ! python3 -c "import websockets" 2>/dev/null; then
-    info "Installing websockets..."
-    python3 -m pip install websockets -q 2>/dev/null || pip3 install websockets -q 2>/dev/null || fail "websockets is missing"
-fi
-ok "websockets"
-
-if ! python3 -c "from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey" 2>/dev/null; then
-    info "Installing cryptography..."
-    python3 -m pip install cryptography -q 2>/dev/null || pip3 install cryptography -q 2>/dev/null || fail "cryptography is missing (required for signed updates)"
-fi
-ok "cryptography"
+ensure_python_deps
+ok "Dependencies installed (websockets, cryptography)"
 
 command -v curl &>/dev/null || fail "curl is required"
 
 mkdir -p "$INSTALL_DIR/uploads"
 
-# ── Download ──
-info "Downloading connector..."
-curl -sSL "${API_URL}/dl/connector.py" -o "$INSTALL_DIR/connector.py" || fail "Download connector.py failed"
-curl -sSL "${API_URL}/dl/pty-manager.py" -o "$INSTALL_DIR/pty-manager.py" || fail "Download pty-manager.py failed"
-curl -sSL "${API_URL}/dl/aiterm" -o "$BIN_DIR/aiterm" || fail "Download aiterm CLI failed"
-chmod +x "$INSTALL_DIR/connector.py" "$INSTALL_DIR/pty-manager.py" "$BIN_DIR/aiterm"
-ok "Connector installed"
+# ── Download (signed + hash-verified) ──
+info "Downloading connector (signed manifest)..."
+signed_download
+ok "Connector installed (Ed25519 signature + SHA-256 verified)"
 [ "$BIN_DIR" != "/usr/local/bin" ] && ensure_path "$BIN_DIR"
 
 # ── Pairing ──
