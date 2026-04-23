@@ -9,6 +9,17 @@ info()  { echo -e "${CYAN}  ▸${NC} $1"; }
 ok()    { echo -e "${GREEN}  ✓${NC} $1"; }
 fail()  { echo -e "${RED}  ✗${NC} $1"; exit 1; }
 
+# ── CLI flags ─────────────────────────────────────────────────
+# --pair / --repair : force a new pairing even if an existing installation is
+#                     detected. Useful when the machine is no longer recognised
+#                     by the hub or should be re-linked to a different account.
+FORCE_PAIR=0
+for arg in "$@"; do
+    case "$arg" in
+        --pair|--repair|--reinstall) FORCE_PAIR=1 ;;
+    esac
+done
+
 ensure_path() {
     # Add ~/.local/bin to PATH if not already there (user mode)
     local BDIR="$1"
@@ -292,7 +303,21 @@ else
 fi
 
 # ── Detect existing installation ──
-if [ -f "$INSTALL_DIR/connector.json" ] && [ -f "$INSTALL_DIR/connector.py" ]; then
+# Extract hub_token from connector.json (if any) to decide update vs pair.
+HAS_PAIRING=0
+if [ -f "$INSTALL_DIR/connector.json" ]; then
+    EXISTING_TOKEN=$(python3 -c "import json,sys
+try:
+    print(json.load(open('$INSTALL_DIR/connector.json')).get('hub_token',''))
+except Exception:
+    print('')" 2>/dev/null)
+    if [ -n "$EXISTING_TOKEN" ]; then
+        HAS_PAIRING=1
+    fi
+fi
+
+# Update mode ONLY if: existing install + valid pairing + user didn't ask to re-pair
+if [ -f "$INSTALL_DIR/connector.json" ] && [ -f "$INSTALL_DIR/connector.py" ] && [ "$HAS_PAIRING" -eq 1 ] && [ "$FORCE_PAIR" -eq 0 ]; then
     echo ""
     echo -e "${BOLD}  ┌──────────────────────────────────────┐${NC}"
     echo -e "${BOLD}  │       AITerm Connector Update         │${NC}"
@@ -379,12 +404,28 @@ if [ -f "$INSTALL_DIR/connector.json" ] && [ -f "$INSTALL_DIR/connector.py" ]; t
     exit 0
 fi
 
-# ── Fresh install ──
+# ── Fresh install (or re-pair of existing install) ──
 echo ""
-echo -e "${BOLD}  ┌──────────────────────────────────────┐${NC}"
-echo -e "${BOLD}  │         AITerm Connector Setup        │${NC}"
-echo -e "${BOLD}  └──────────────────────────────────────┘${NC}"
-echo ""
+if [ "$FORCE_PAIR" -eq 1 ] && [ -f "$INSTALL_DIR/connector.json" ]; then
+    echo -e "${BOLD}  ┌──────────────────────────────────────┐${NC}"
+    echo -e "${BOLD}  │     AITerm Connector Re-Pairing       │${NC}"
+    echo -e "${BOLD}  └──────────────────────────────────────┘${NC}"
+    echo ""
+    info "Re-pairing existing installation ($INSTALL_DIR)"
+    # Stop running services so the new pairing takes effect on restart.
+    $SVC_CMD stop aiterm-connector aiterm-pty 2>/dev/null || true
+elif [ "$HAS_PAIRING" -eq 0 ] && [ -f "$INSTALL_DIR/connector.py" ]; then
+    echo -e "${BOLD}  ┌──────────────────────────────────────┐${NC}"
+    echo -e "${BOLD}  │      AITerm Connector Pairing         │${NC}"
+    echo -e "${BOLD}  └──────────────────────────────────────┘${NC}"
+    echo ""
+    info "Existing installation detected, but no pairing yet. Starting pairing flow."
+else
+    echo -e "${BOLD}  ┌──────────────────────────────────────┐${NC}"
+    echo -e "${BOLD}  │         AITerm Connector Setup        │${NC}"
+    echo -e "${BOLD}  └──────────────────────────────────────┘${NC}"
+    echo ""
+fi
 
 if [ "$MODE" = "system" ]; then
     info "System-wide installation (root)"
