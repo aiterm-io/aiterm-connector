@@ -412,7 +412,7 @@ async def push_to_hub(config):
 
                         # ── Commands that go to PTY manager ──
                         if t == "start_ai" and pty_writer:
-                            pty_writer.write((json.dumps({"t": "start", "sid": sid, "ai": msg.get("ai", ""), "cwd": msg.get("cwd", "")}) + "\n").encode())
+                            pty_writer.write((json.dumps({"t": "start", "sid": sid, "ai": msg.get("ai", ""), "cwd": msg.get("cwd", ""), "guard": bool(msg.get("guard", False))}) + "\n").encode())
                             await pty_writer.drain()
                         elif t == "stop_ai" and pty_writer:
                             pty_writer.write((json.dumps({"t": "stop", "sid": sid}) + "\n").encode())
@@ -422,6 +422,12 @@ async def push_to_hub(config):
                             await pty_writer.drain()
                         elif t == "r" and sid and pty_writer:
                             pty_writer.write((json.dumps({"t": "resize", "sid": sid, "rows": msg.get("rows", 30), "cols": msg.get("cols", 120)}) + "\n").encode())
+                            await pty_writer.drain()
+                        elif t == "guard_response" and sid and pty_writer:
+                            pty_writer.write((json.dumps({"t": "guard_response", "sid": sid, "approve": bool(msg.get("approve", False))}) + "\n").encode())
+                            await pty_writer.drain()
+                        elif t == "set_guard" and sid and pty_writer:
+                            pty_writer.write((json.dumps({"t": "set_guard", "sid": sid, "enabled": bool(msg.get("enabled", False))}) + "\n").encode())
                             await pty_writer.drain()
 
                         # ── Handled locally by connector ──

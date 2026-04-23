@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import pty
+import re
 import shutil
 import signal
 import struct
@@ -37,6 +38,49 @@ _ENV_ALLOWED = {
 }
 
 
+# ─── Guard Mode: dangerous-command pattern list ──────────────
+# Open source by design — defense relies on human-in-the-loop, not obscurity.
+# Only triggers for bash sessions where the machine has guard_enabled=True.
+_GUARD_PATTERNS = [
+    # Destructive filesystem
+    (re.compile(r"\brm\s+(?:-[a-zA-Z]*r[a-zA-Z]*f|-[a-zA-Z]*f[a-zA-Z]*r|-[rR]\b.*\s-f\b|-f\b.*\s-[rR]\b)"), "recursive forced delete"),
+    (re.compile(r"\brm\s+.*\s/\s*(?:$|;|&)"), "rm targeting root"),
+    (re.compile(r"\bfind\s+.+-delete\b"), "find with -delete"),
+    (re.compile(r"\bdd\s+.*\bof=/dev/(?:sd|nvme|disk|hd|mmcblk|vda|xvd)"), "dd to block device"),
+    (re.compile(r"\bmkfs(?:\.[a-z0-9]+)?\b"), "filesystem format"),
+    (re.compile(r"\bshred\s+-[a-z]*(?:z|u)"), "shred with delete"),
+    # Pipe-to-interpreter (classic curl|bash)
+    (re.compile(r"\b(?:curl|wget|fetch)\s[^;|&]*\|\s*(?:sh|bash|zsh|fish|ksh|python3?|perl|ruby|node)\b"), "pipe remote content to interpreter"),
+    # System-level
+    (re.compile(r"\b(?:shutdown|halt|poweroff|reboot|init\s+0|init\s+6)\b"), "system shutdown/reboot"),
+    (re.compile(r"\b(?:systemctl|service)\s+(?:stop|disable|mask)\b"), "stop or disable service"),
+    # Network / firewall destructive
+    (re.compile(r"\biptables\s+-F\b"), "flush iptables"),
+    (re.compile(r"\bufw\s+disable\b"), "disable ufw firewall"),
+    (re.compile(r"\bnftables\s+flush\b"), "flush nftables"),
+    # Chmod/chown on root or wide wildcards
+    (re.compile(r"\bchmod\s+(?:-R\s+)?(?:777|a\+w)\s+(?:/|/\*|/\s|/$)"), "chmod wide-open at root"),
+    (re.compile(r"\bchown\s+(?:-R\s+)?\S+\s+/(?:$|\s)"), "chown at root"),
+    # Redirect to block device
+    (re.compile(r">\s*/dev/(?:sda|sdb|nvme|mmcblk|xvd|vda|disk\d)"), "write to block device"),
+    # Eval-like
+    (re.compile(r"\beval\s+[\"'`$]"), "eval with dynamic input"),
+    # Fork bomb
+    (re.compile(r":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}"), "fork bomb"),
+    # Overwriting authorized_keys
+    (re.compile(r">\s*~?/?\.ssh/authorized_keys\b"), "overwrite SSH authorized_keys"),
+    (re.compile(r">>\s*~?/?\.ssh/authorized_keys\b"), "append to SSH authorized_keys"),
+]
+
+
+def guard_check(line: str):
+    """Return (True, reason) if the command line matches a dangerous pattern, else (False, None)."""
+    for rx, reason in _GUARD_PATTERNS:
+        if rx.search(line):
+            return True, reason
+    return False, None
+
+
 def _sanitized_env():
     """Whitelisted env for spawned PTYs. Blocks credential leak from
     connector-process env into user shells (AWS_*, ANTHROPIC_API_KEY,
@@ -54,7 +98,7 @@ def _sanitized_env():
 class PtySession:
     """A single PTY process (AI session)."""
 
-    def __init__(self, sid, cmd, cwd, loop, cmd_args=None):
+    def __init__(self, sid, cmd, cwd, loop, cmd_args=None, guard_enabled=False):
         self.sid = sid
         self.cmd = cmd
         self.cmd_args = cmd_args or []
@@ -65,6 +109,16 @@ class PtySession:
         self.started_at = None  # set on spawn
         self.loop = loop
         self.clients = set()
+        # Guard Mode state (active only when self.ai_base == "bash")
+        self.guard_enabled = bool(guard_enabled)
+        self._guard_line = b""            # accumulator for the current input line
+        self._guard_pending = None        # pending command string while awaiting user confirmation
+        self._guard_held = b""            # data held back (terminator + any trailing bytes)
+        self._guard_cb = None             # callable(line, reason) invoked on pattern match
+
+    @property
+    def _is_bash(self):
+        return os.path.basename(self.cmd or "") in ("bash", "sh", "zsh", "fish")
 
     def spawn(self):
         self.kill()
@@ -118,11 +172,121 @@ class PtySession:
                     pass
 
     def write(self, data):
-        if self.fd is not None:
+        if self.fd is None:
+            return
+        # Fast path: guard off, or non-bash session, or nothing to scan
+        if not self.guard_enabled or not self._is_bash:
             try:
                 os.write(self.fd, data)
             except OSError:
                 pass
+            return
+        # Guard path: while a confirmation is pending, buffer everything
+        if self._guard_pending is not None:
+            self._guard_held += data
+            return
+        # Scan for line terminators (\r or \n); intercept them.
+        i = 0
+        n = len(data)
+        while i < n:
+            b = data[i:i+1]
+            if b in (b"\r", b"\n"):
+                # Flush bytes BEFORE the terminator to bash (so live-echo works)
+                if i > 0:
+                    try:
+                        os.write(self.fd, data[:i])
+                    except OSError:
+                        return
+                    self._guard_line += data[:i]
+                # Evaluate the accumulated line
+                try:
+                    line_str = self._guard_line.decode("utf-8", errors="replace").strip()
+                except Exception:
+                    line_str = ""
+                dangerous, reason = guard_check(line_str) if line_str else (False, None)
+                if dangerous:
+                    # Hold the terminator + any trailing data
+                    self._guard_pending = line_str
+                    self._guard_held = data[i:]
+                    # Reset line buffer; next user input (while pending) goes to _guard_held
+                    self._guard_line = b""
+                    if self._guard_cb:
+                        try:
+                            self._guard_cb(line_str, reason)
+                        except Exception as e:
+                            log.warning(f"guard callback failed: {e}")
+                    return
+                # Safe: write terminator, keep scanning remainder
+                try:
+                    os.write(self.fd, b)
+                except OSError:
+                    return
+                self._guard_line = b""
+                i += 1
+                data = data[i:]
+                n = len(data)
+                i = 0
+                continue
+            elif b == b"\x03":  # Ctrl-C resets the line
+                self._guard_line = b""
+                try:
+                    os.write(self.fd, b)
+                except OSError:
+                    return
+                i += 1
+                data = data[i:]
+                n = len(data)
+                i = 0
+                continue
+            elif b in (b"\x08", b"\x7f"):  # backspace / delete
+                if self._guard_line:
+                    self._guard_line = self._guard_line[:-1]
+                try:
+                    os.write(self.fd, b)
+                except OSError:
+                    return
+                i += 1
+                data = data[i:]
+                n = len(data)
+                i = 0
+                continue
+            else:
+                self._guard_line += b
+                i += 1
+        # No terminator in this chunk: forward everything
+        if data:
+            try:
+                os.write(self.fd, data)
+            except OSError:
+                pass
+
+    def guard_resolve(self, approve: bool):
+        """Called when user responds to a guard_confirm dialog."""
+        if self._guard_pending is None:
+            return
+        self._guard_pending = None
+        held = self._guard_held
+        self._guard_held = b""
+        self._guard_line = b""
+        if self.fd is None:
+            return
+        try:
+            if approve:
+                # Release the held data (terminator + whatever followed)
+                os.write(self.fd, held)
+            else:
+                # Cancel: send Ctrl-C so bash clears its readline buffer and shows a fresh prompt.
+                # Drop the held data.
+                os.write(self.fd, b"\x03")
+        except OSError:
+            pass
+
+    def set_guard(self, enabled: bool):
+        was = self.guard_enabled
+        self.guard_enabled = bool(enabled)
+        # If we're turning off while a prompt is pending, auto-approve (fail-open to avoid stuck session)
+        if was and not self.guard_enabled and self._guard_pending is not None:
+            self.guard_resolve(True)
 
     def is_alive(self):
         if not self.pid:
@@ -354,8 +518,21 @@ async def handle_client(reader, writer):
                     cmd = binary
                     cmd_args = []
 
-                sess = PtySession(sid, cmd, cwd, asyncio.get_event_loop(), cmd_args=cmd_args)
+                guard_enabled = bool(msg.get("guard", False))
+                sess = PtySession(sid, cmd, cwd, asyncio.get_event_loop(), cmd_args=cmd_args, guard_enabled=guard_enabled)
                 sess.clients.add(writer)
+
+                # Wire guard callback to push confirmation requests upstream
+                def _make_cb(bound_sid):
+                    def _cb(line, reason):
+                        for w in list(sess.clients):
+                            try:
+                                w.write((json.dumps({"t": "guard_confirm", "sid": bound_sid, "cmd": line[:400], "reason": reason}) + "\n").encode())
+                            except Exception:
+                                pass
+                    return _cb
+                sess._guard_cb = _make_cb(sid)
+
                 sess.spawn()
                 sessions[sid] = sess
 
@@ -383,6 +560,17 @@ async def handle_client(reader, writer):
                 sess = sessions.get(sid)
                 if sess:
                     sess.write(base64.b64decode(msg.get("d", "")))
+
+            elif t == "guard_response":
+                sess = sessions.get(sid)
+                if sess:
+                    sess.guard_resolve(bool(msg.get("approve", False)))
+
+            elif t == "set_guard":
+                # Live toggle for an existing session
+                sess = sessions.get(sid)
+                if sess:
+                    sess.set_guard(bool(msg.get("enabled", False)))
 
             elif t == "resize":
                 sess = sessions.get(sid)
