@@ -522,16 +522,18 @@ async def handle_client(reader, writer):
                 sess = PtySession(sid, cmd, cwd, asyncio.get_event_loop(), cmd_args=cmd_args, guard_enabled=guard_enabled)
                 sess.clients.add(writer)
 
-                # Wire guard callback to push confirmation requests upstream
-                def _make_cb(bound_sid):
-                    def _cb(line, reason):
-                        for w in list(sess.clients):
+                # Wire guard callback to push confirmation requests upstream.
+                # Explicit parameters avoid closure-over-loop-variable issues.
+                def _make_guard_cb(bound_sid, bound_sess):
+                    def _cb(cmd_line, reason):
+                        payload = json.dumps({"t": "guard_confirm", "sid": bound_sid, "cmd": cmd_line[:400], "reason": reason}) + "\n"
+                        for w in list(bound_sess.clients):
                             try:
-                                w.write((json.dumps({"t": "guard_confirm", "sid": bound_sid, "cmd": line[:400], "reason": reason}) + "\n").encode())
+                                w.write(payload.encode())
                             except Exception:
                                 pass
                     return _cb
-                sess._guard_cb = _make_cb(sid)
+                sess._guard_cb = _make_guard_cb(sid, sess)
 
                 sess.spawn()
                 sessions[sid] = sess
