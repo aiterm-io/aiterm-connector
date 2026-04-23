@@ -415,11 +415,14 @@ async def handle_client(reader, writer):
     except Exception:
         pass
 
-    # Send scrollback for all active sessions
+    # Send scrollback for all active sessions. Marked with replay=true so the
+    # hub REPLACES its scrollback (not appends) and does NOT rebroadcast to
+    # already-connected browsers — they already have this content.
     for sess in sessions.values():
         if sess.scrollback:
             try:
-                msg = json.dumps({"t": "o", "sid": sess.sid, "d": base64.b64encode(bytes(sess.scrollback)).decode()}) + "\n"
+                msg = json.dumps({"t": "o", "sid": sess.sid, "replay": True,
+                                  "d": base64.b64encode(bytes(sess.scrollback)).decode()}) + "\n"
                 writer.write(msg.encode())
                 await writer.drain()
             except Exception:
