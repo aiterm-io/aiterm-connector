@@ -559,7 +559,97 @@ echo ""
 ok "Pairing confirmed!"
 
 # ── Config ──
-DEFAULT_CWD=$(eval echo ~)
+# Pick a default working directory for new sessions. Priority:
+#   1. If re-pair and old connector.json had a valid default_cwd → keep it.
+#   2. Scan for Claude-ready directories (CLAUDE.md, .mcp.json — strong
+#      signals of a project set up to work with Claude; .claude/ on its own
+#      is usually the CLI's own home-dir state, not a project, so it is
+#      intentionally NOT treated as a signal).
+#      - exactly one match → use it silently.
+#      - multiple matches → show numbered list, let user pick (default to #1
+#        after 20s so non-interactive curl|bash runs don't block).
+#   3. Fallback: user's $HOME.
+DEFAULT_CWD=""
+if [ "$IS_REPAIR" = "1" ] && [ -n "$BACKUP_JSON" ] && [ -f "$BACKUP_JSON" ]; then
+    OLD_CWD=$(python3 -c "import json
+try: print(json.load(open('$BACKUP_JSON')).get('default_cwd',''))
+except Exception: print('')" 2>/dev/null)
+    if [ -n "$OLD_CWD" ] && [ -d "$OLD_CWD" ]; then
+        DEFAULT_CWD="$OLD_CWD"
+        info "Keeping working directory: ${BOLD}$DEFAULT_CWD${NC}"
+    fi
+fi
+
+if [ -z "$DEFAULT_CWD" ]; then
+    info "Scanning for Claude-ready directories..."
+    # Search filesystem roots for signatures (parent dirs of CLAUDE.md / .mcp.json).
+    # Limit depth to 4, skip our own install, dedupe by sorted unique path.
+    CANDIDATES=$(
+        {
+            find /root -maxdepth 4 \( -name 'CLAUDE.md' -type f -o -name '.mcp.json' -type f -o -path '*/.claude/settings.json' -o -path '*/.claude/settings.local.json' \) 2>/dev/null
+            [ -d /home ] && find /home -maxdepth 5 \( -name 'CLAUDE.md' -type f -o -name '.mcp.json' -type f -o -path '*/.claude/settings.json' -o -path '*/.claude/settings.local.json' \) 2>/dev/null
+            [ -d /opt ] && find /opt -maxdepth 4 \( -name 'CLAUDE.md' -type f -o -name '.mcp.json' -type f -o -path '*/.claude/settings.json' -o -path '*/.claude/settings.local.json' \) 2>/dev/null
+            [ -d /srv ] && find /srv -maxdepth 4 \( -name 'CLAUDE.md' -type f -o -name '.mcp.json' -type f -o -path '*/.claude/settings.json' -o -path '*/.claude/settings.local.json' \) 2>/dev/null
+            [ -d /var/www ] && find /var/www -maxdepth 4 \( -name 'CLAUDE.md' -type f -o -name '.mcp.json' -type f -o -path '*/.claude/settings.json' -o -path '*/.claude/settings.local.json' \) 2>/dev/null
+        } 2>/dev/null | while IFS= read -r p; do
+            d=$(dirname "$p")
+            # If the signature was .claude/settings*.json, the candidate dir is the
+            # project (grandparent of the file), not .claude/ itself.
+            case "$d" in
+                */.claude) d=$(dirname "$d") ;;
+            esac
+            case "$d" in
+                /opt/aiterm|/opt/aiterm/*) continue ;;
+            esac
+            echo "$d"
+        done | sort -u
+    )
+    N=$(echo "$CANDIDATES" | grep -c . 2>/dev/null || echo 0)
+
+    if [ "$N" -eq 0 ]; then
+        DEFAULT_CWD=$(eval echo ~)
+        info "No Claude-ready project detected. Default: ${BOLD}$DEFAULT_CWD${NC}"
+    elif [ "$N" -eq 1 ]; then
+        DEFAULT_CWD="$CANDIDATES"
+        ok "Found a Claude-ready project: ${BOLD}$DEFAULT_CWD${NC}"
+    else
+        echo ""
+        echo -e "${BOLD}  Found $N Claude-ready projects:${NC}"
+        echo ""
+        IDX=1
+        CAND_LIST=()
+        while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            CAND_LIST+=("$line")
+            # Show which signatures hit
+            sigs=""
+            [ -f "$line/CLAUDE.md" ] && sigs="$sigs CLAUDE.md"
+            [ -f "$line/.mcp.json" ] && sigs="$sigs .mcp.json"
+            [ -f "$line/.claude/settings.json" ] && sigs="$sigs .claude/settings.json"
+            [ -f "$line/.claude/settings.local.json" ] && sigs="$sigs .claude/settings.local.json"
+            printf "  ${CYAN}%2d${NC}  %s${DIM}  (%s )${NC}\n" "$IDX" "$line" "$sigs"
+            IDX=$((IDX+1))
+        done <<< "$CANDIDATES"
+        # Fallback HOME option
+        HOME_DEFAULT=$(eval echo ~)
+        printf "  ${CYAN}%2d${NC}  %s  ${DIM}(home directory)${NC}\n" "$IDX" "$HOME_DEFAULT"
+        CAND_LIST+=("$HOME_DEFAULT")
+        HOME_IDX="$IDX"
+        echo ""
+        echo -ne "  Select working directory [1]: "
+        CHOICE=""
+        if read -t 20 -r CHOICE < /dev/tty 2>/dev/null; then
+            :
+        fi
+        CHOICE="${CHOICE:-1}"
+        if [[ "$CHOICE" =~ ^[0-9]+$ ]] && [ "$CHOICE" -ge 1 ] && [ "$CHOICE" -le "$IDX" ]; then
+            DEFAULT_CWD="${CAND_LIST[$((CHOICE-1))]}"
+        else
+            DEFAULT_CWD="${CAND_LIST[0]}"
+        fi
+        ok "Working directory: ${BOLD}$DEFAULT_CWD${NC}"
+    fi
+fi
 
 python3 - "$INSTALL_DIR" "$HUB_URL" "$TOKEN" "$DEFAULT_CWD" "$HOSTNAME" << 'PYCFG'
 import json, sys, os
