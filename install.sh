@@ -405,15 +405,52 @@ if [ -f "$INSTALL_DIR/connector.json" ] && [ -f "$INSTALL_DIR/connector.py" ] &&
 fi
 
 # ── Fresh install (or re-pair of existing install) ──
-echo ""
+# Pre-existing state we must be able to restore if anything below fails.
+PRESERVED_NAME=""
+BACKUP_JSON=""
+IS_REPAIR=0
 if [ "$FORCE_PAIR" -eq 1 ] && [ -f "$INSTALL_DIR/connector.json" ]; then
+    IS_REPAIR=1
+    BACKUP_JSON=$(mktemp)
+    cp "$INSTALL_DIR/connector.json" "$BACKUP_JSON"
+    # Carry over the friendly name so the re-pair shows up with the same label.
+    PRESERVED_NAME=$(python3 -c "import json
+try: print(json.load(open('$INSTALL_DIR/connector.json')).get('name',''))
+except Exception: print('')" 2>/dev/null)
+fi
+
+# Guarantee services come back up no matter how the script exits from here on.
+# In repair mode: if pairing fails, restore the old connector.json + old services.
+# In fresh install: services just get (re)started at the end.
+cleanup_on_fail() {
+    local rc=$?
+    [ $rc -eq 0 ] && return
+    echo ""
+    echo -e "${YELLOW}  !${NC} Something went wrong. Cleaning up so your system is not left broken."
+    if [ "$IS_REPAIR" = "1" ] && [ -n "$BACKUP_JSON" ] && [ -f "$BACKUP_JSON" ]; then
+        cp "$BACKUP_JSON" "$INSTALL_DIR/connector.json"
+        chmod 600 "$INSTALL_DIR/connector.json" 2>/dev/null || true
+        echo -e "${GREEN}  ✓${NC} Restored previous connector.json (re-pair aborted, old pairing still valid)."
+    fi
+    # Best-effort service restart so the customer is not stuck.
+    $SVC_CMD start aiterm-pty aiterm-connector 2>/dev/null || true
+    rm -f "$BACKUP_JSON" 2>/dev/null
+    echo -e "${DIM}  Retry with:  curl -sSL https://aiterm.io/pair | sh${NC}"
+    echo ""
+    exit $rc
+}
+trap cleanup_on_fail EXIT
+
+echo ""
+if [ "$IS_REPAIR" = "1" ]; then
     echo -e "${BOLD}  ┌──────────────────────────────────────┐${NC}"
     echo -e "${BOLD}  │     AITerm Connector Re-Pairing       │${NC}"
     echo -e "${BOLD}  └──────────────────────────────────────┘${NC}"
     echo ""
     info "Re-pairing existing installation ($INSTALL_DIR)"
-    # Stop running services so the new pairing takes effect on restart.
-    $SVC_CMD stop aiterm-connector aiterm-pty 2>/dev/null || true
+    if [ -n "$PRESERVED_NAME" ]; then
+        info "Keeping machine name: ${BOLD}$PRESERVED_NAME${NC}"
+    fi
 elif [ "$HAS_PAIRING" -eq 0 ] && [ -f "$INSTALL_DIR/connector.py" ]; then
     echo -e "${BOLD}  ┌──────────────────────────────────────┐${NC}"
     echo -e "${BOLD}  │      AITerm Connector Pairing         │${NC}"
@@ -458,7 +495,14 @@ ok "Connector installed (Ed25519 signature + SHA-256 verified)"
 [ "$BIN_DIR" != "/usr/local/bin" ] && ensure_path "$BIN_DIR"
 
 # ── Pairing ──
-HOSTNAME=$(hostname)
+# On re-pair, reuse the customer's existing machine name instead of silently
+# reverting to the bare hostname (which often looks like 'v22018...'-style
+# cloud IDs and confuses users).
+if [ -n "$PRESERVED_NAME" ]; then
+    HOSTNAME="$PRESERVED_NAME"
+else
+    HOSTNAME=$(hostname)
+fi
 
 info "Registering with AITerm..."
 PAIRING_RESP=$(curl -sSL -X POST "${API_URL}/api/pairing/request" \
@@ -578,8 +622,17 @@ else
     fail "Connector failed to start. Check: journalctl -u aiterm-connector"
 fi
 
+# Success — cancel the cleanup trap and remove backup.
+trap - EXIT
+[ -n "$BACKUP_JSON" ] && rm -f "$BACKUP_JSON"
+
 echo ""
-echo -e "  ${GREEN}${BOLD}Done!${NC} Machine will appear in the dashboard."
+if [ "$IS_REPAIR" = "1" ]; then
+    echo -e "  ${GREEN}${BOLD}Re-paired.${NC} Machine reconnected under the new token."
+    echo -e "  ${DIM}The old entry may show as 'offline' in the dashboard — you can remove it with the 'Entfernen' button.${NC}"
+else
+    echo -e "  ${GREEN}${BOLD}Done!${NC} Machine will appear in the dashboard."
+fi
 echo -e "  ${DIM}AI backends can be scanned from the dashboard.${NC}"
 
 if [ "$MODE" = "user" ]; then

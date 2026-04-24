@@ -24,6 +24,12 @@ fi
 case "${1:-}" in
   update)   exec $PY "$DIR/connector.py" --update ;;
   scan)     exec $PY "$DIR/connector.py" --scan ;;
+  pair|repair)
+    # Re-pair this machine with a fresh token (keeps the name, keeps code,
+    # restores old pairing if the flow fails). Use when the machine was
+    # removed from the hub or you want to move it to a different account.
+    exec bash -c "$(curl -sSL https://aiterm.io/install)" bash --pair
+    ;;
   status)
     echo ""
     if [ "$SVC_WORKS" -eq 1 ]; then
@@ -167,6 +173,7 @@ print(f\"  Dir:   $DIR\")
     echo "  aiterm stop        Stop connector"
     echo "  aiterm restart     Restart connector"
     echo "  aiterm update      Update connector from server"
+    echo "  aiterm pair        Re-pair this machine (new token, keeps name)"
     echo "  aiterm scan        Scan for AI backends"
     echo "  aiterm logs        Show recent logs"
     echo "  aiterm logs 100    Show last 100 log entries"
