@@ -237,6 +237,41 @@ def scan():
     if shutil.which("gpt4all"):
         running, _ = _proc_running(["gpt4all"])
         ai["gpt4all"] = {"path": shutil.which("gpt4all"), "running": running}
+
+    # New CLI-based backends (codex, gemini, goose, qwen, aider, llm, sgpt).
+    # Same detection pattern: binary present → advertise it. Interactive args
+    # (e.g. "goose session", "llm chat") are applied in pty-manager.
+    SIMPLE_BACKENDS = [
+        ("codex",  ["codex"]),
+        ("gemini", ["gemini"]),
+        ("goose",  ["goose session", "goose run"]),
+        ("qwen",   ["qwen"]),
+        ("aider",  ["aider"]),
+        ("llm",    ["llm chat", "llm repl"]),
+        ("sgpt",   ["sgpt --repl", "sgpt --chat"]),
+    ]
+    for name, running_patterns in SIMPLE_BACKENDS:
+        p = shutil.which(name)
+        # Also check common user-local paths that may not be on PATH under systemd
+        if not p:
+            for cand in (f"/root/.local/bin/{name}",
+                         os.path.expanduser(f"~/.local/bin/{name}"),
+                         f"/usr/local/bin/{name}"):
+                if os.path.isfile(cand) and os.access(cand, os.X_OK):
+                    p = cand
+                    break
+        if p:
+            v = ""
+            try:
+                r = subprocess.run([p, "--version"], capture_output=True, text=True, timeout=5)
+                v = (r.stdout or r.stderr).strip().splitlines()[0] if (r.stdout or r.stderr) else ""
+                if not v or len(v) > 80 or "panic" in v.lower():
+                    v = "installed"
+            except Exception:
+                v = "installed"
+            running, _ = _proc_running(running_patterns)
+            ai[name] = {"path": p, "version": v, "running": running}
+
     info["ai"] = ai
 
     return info

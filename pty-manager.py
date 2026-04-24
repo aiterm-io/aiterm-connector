@@ -339,15 +339,43 @@ AI_COMMANDS = {
     "localai": "local-ai",
     "gpt4all": "gpt4all",
     "bash": "bash",
+    "codex": "codex",
+    "gemini": "gemini",
+    "goose": "goose",
+    "qwen": "qwen",
+    "aider": "aider",
+    "llm": "llm",
+    "sgpt": "sgpt",
 }
 
+# Default args that switch a CLI into interactive/REPL mode.
+AI_DEFAULT_ARGS = {
+    "goose": ["session"],
+    "llm": ["chat"],
+    "sgpt": ["--repl", "temp"],
+}
+
+def _user_bin_paths(bin_name):
+    paths = [
+        os.path.expanduser(f"~/.local/bin/{bin_name}"),
+        f"/root/.local/bin/{bin_name}",
+        f"/usr/local/bin/{bin_name}",
+        f"/usr/bin/{bin_name}",
+    ]
+    # npm global installs (gemini, qwen, codex often land here)
+    for npm_prefix in ("/usr/local/lib/node_modules/.bin", "/opt/homebrew/bin"):
+        paths.append(f"{npm_prefix}/{bin_name}")
+    return paths
+
 EXTRA_PATHS = {
-    "claude": [
-        os.path.expanduser("~/.local/bin/claude"),
-        "/root/.local/bin/claude",
-        "/usr/local/bin/claude",
-        "/usr/bin/claude",
-    ],
+    "claude": _user_bin_paths("claude"),
+    "codex": _user_bin_paths("codex"),
+    "gemini": _user_bin_paths("gemini"),
+    "goose": _user_bin_paths("goose"),
+    "qwen": _user_bin_paths("qwen"),
+    "aider": _user_bin_paths("aider") + [os.path.expanduser("~/.local/pipx/venvs/aider-chat/bin/aider")],
+    "llm": _user_bin_paths("llm"),
+    "sgpt": _user_bin_paths("sgpt"),
 }
 
 
@@ -519,7 +547,7 @@ async def handle_client(reader, writer):
                     continue
                 else:
                     cmd = binary
-                    cmd_args = []
+                    cmd_args = list(AI_DEFAULT_ARGS.get(ai_base, []))
 
                 guard_enabled = bool(msg.get("guard", False))
                 sess = PtySession(sid, cmd, cwd, asyncio.get_event_loop(), cmd_args=cmd_args, guard_enabled=guard_enabled)
@@ -541,10 +569,22 @@ async def handle_client(reader, writer):
                 sess.spawn()
                 sessions[sid] = sess
 
-                ai_name = ai_model or ai_base.title()
-                if ai_base == "claude":
-                    ai_name = "Claude Code"
-                elif ai_base == "ollama" and ai_model:
+                FRIENDLY_NAMES = {
+                    "claude": "Claude Code",
+                    "codex": "Codex",
+                    "gemini": "Gemini",
+                    "goose": "Goose",
+                    "qwen": "Qwen",
+                    "aider": "Aider",
+                    "llm": "llm",
+                    "sgpt": "ShellGPT",
+                    "llamacpp": "llama.cpp",
+                    "localai": "LocalAI",
+                    "gpt4all": "GPT4All",
+                    "bash": "Bash",
+                }
+                ai_name = FRIENDLY_NAMES.get(ai_base, ai_model or ai_base.title())
+                if ai_base == "ollama" and ai_model:
                     ai_name = "Ollama: " + ai_model
                 import time as _time
                 resp = {"t": "started", "sid": sid, "ai": ai_type, "name": ai_name, "cwd": cwd, "started_at": _time.time()}
