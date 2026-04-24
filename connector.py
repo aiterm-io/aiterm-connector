@@ -47,6 +47,69 @@ CONFIG_PATH = BASE_DIR / "connector.json"
 ALLOWED_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".pdf", ".webm", ".ogg", ".mp3", ".wav", ".m4a"}  # No .svg — XSS risk
 
 # ─── Scanner ─────────────────────────────────────────────────
+def scan_project_dirs(max_results=25):
+    """Scan the filesystem for directories with Claude-ready signatures.
+    Returns a list of {"path": str, "signatures": [str, ...]} entries, sorted by
+    path. Signatures: CLAUDE.md, .mcp.json, .claude/settings.json, .claude/settings.local.json.
+    The connector's own install dir is excluded."""
+    import os
+    roots_config = [
+        ("/root", 4),
+        ("/home", 5),
+        ("/opt", 4),
+        ("/srv", 4),
+        ("/var/www", 4),
+    ]
+    self_path = str(BASE_DIR)
+    found = {}  # path → set of signatures
+
+    def _mark(path, sig):
+        if not path:
+            return
+        # Exclude our own install to avoid recommending it
+        if path == self_path or path.startswith(self_path + os.sep):
+            return
+        found.setdefault(path, set()).add(sig)
+
+    for root, max_depth in roots_config:
+        if not os.path.isdir(root):
+            continue
+        root_depth = root.count(os.sep)
+        try:
+            for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+                # Limit depth
+                rel_depth = dirpath.count(os.sep) - root_depth
+                if rel_depth >= max_depth:
+                    dirnames[:] = []
+                    continue
+                # Skip common junk
+                dirnames[:] = [d for d in dirnames if d not in
+                    ("node_modules", ".git", ".venv", "venv", "__pycache__", "target", "dist", "build")]
+                # File-based signatures
+                if "CLAUDE.md" in filenames:
+                    _mark(dirpath, "CLAUDE.md")
+                if ".mcp.json" in filenames:
+                    _mark(dirpath, ".mcp.json")
+                # .claude/settings*.json (project-scoped Claude Code settings)
+                if ".claude" in dirnames:
+                    cdir = os.path.join(dirpath, ".claude")
+                    try:
+                        for f in os.listdir(cdir):
+                            if f in ("settings.json", "settings.local.json"):
+                                _mark(dirpath, f".claude/{f}")
+                    except OSError:
+                        pass
+                if len(found) >= max_results:
+                    break
+        except OSError:
+            continue
+
+    return [
+        {"path": p, "signatures": sorted(sigs)}
+        for p, sigs in sorted(found.items())
+    ]
+
+
 def scan():
     """Auto-detect system and Claude Code installation."""
     info = {
@@ -435,6 +498,21 @@ async def push_to_hub(config):
                             log.info("AI scan requested")
                             ai = scan().get("ai", {})
                             await ws.send(json.dumps({"t": "scan_result", "scan": ai}))
+
+                        elif t == "list_project_dirs":
+                            # Live scan for Claude-ready project directories.
+                            # Cheap enough to run on demand (~100ms on typical boxes).
+                            try:
+                                dirs = scan_project_dirs()
+                            except Exception as e:
+                                log.warning(f"scan_project_dirs failed: {e}")
+                                dirs = []
+                            default_cwd = config.get("default_cwd") or os.path.expanduser("~")
+                            await ws.send(json.dumps({
+                                "t": "project_dirs",
+                                "default": default_cwd,
+                                "dirs": dirs,
+                            }))
 
                         elif t == "remote_update":
                             log.info("Remote update requested")
