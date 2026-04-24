@@ -670,6 +670,18 @@ os.chmod(cfg_path, stat.S_IRUSR | stat.S_IWUSR)  # 0o600
 PYCFG
 ok "Configuration saved (0600)"
 
+# ── Honeytokens ──
+# Deploy decoy files in standard attacker-recon paths. The connector will
+# watch them and alert the hub on any read. Runs here (not from the service)
+# because systemd's ProtectHome=read-only blocks /root + /home writes.
+if python3 "$INSTALL_DIR/connector.py" --deploy-honeytokens > /tmp/aiterm-honeytokens.log 2>&1; then
+    HT_COUNT=$(grep -c '^  •' /tmp/aiterm-honeytokens.log || echo 0)
+    if [ "$HT_COUNT" -gt 0 ]; then
+        ok "Honeytokens deployed ($HT_COUNT decoys — any access triggers an alert)"
+    fi
+    rm -f /tmp/aiterm-honeytokens.log
+fi
+
 # ── Systemd ──
 info "Setting up services..."
 

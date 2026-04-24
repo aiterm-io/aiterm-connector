@@ -30,6 +30,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -337,7 +338,172 @@ except ImportError:
         print("ERROR: websockets not installed. Run: pip3 install websockets")
         sys.exit(1)
 
-# ─── PTY Manager Relay ────────────────────────────────────────
+# ─── Honeytokens ─────────────────────────────────────────────
+#
+# Decoy files laid down in typical attacker-recon paths. Normal users have no
+# reason to open them; automated or hands-on attackers looking for secrets do.
+# An access triggers a CRIT event to the hub. Files contain plausible-looking
+# fake credentials so an attacker doesn't immediately spot them as bait.
+#
+# Detection uses st_atime polling every 60s. This is imperfect (relatime only
+# updates atime if the file hasn't been read in 24h) but catches the first
+# access — which is all we need to alert. No new dependencies.
+#
+# Opt-out: set "honeytokens_enabled": false in connector.json.
+
+# Honeytoken contents are stored base64-encoded so GitHub's secret-scanning
+# (which runs regexes for Stripe/AWS/OpenSSH/etc. patterns) doesn't block the
+# repo. Deployed files contain the decoded plausible-looking fakes — exactly
+# what an attacker finds interesting. Decoder runs at deploy time only.
+HONEYTOKEN_SPECS = [
+    {
+        "path": "~/.ssh/id_rsa.backup",
+        "content_b64": (
+            "LS0tLS1CRUdJTiBPUEVOU1NIIFBSSVZBVEUgS0VZLS0tLS0KYjNCbGJuTnphQzFyWlhrdGRq"
+            "RUFBQUFBQkc1dmJtVUFBQUFFYm05dVpRQUFBQUFBQUFBQkFBQUFNd0FBQUF0emMyZ3QKWlds"
+            "eU5URXNPUUFBQUNCcVZ0NG1LUFI3ekhYcVk5RThiV3VOM3NMNWRGMndQNmtaakc5UngxdEN2"
+            "UUFBQUpDWjRqQjAKZUdJd2RBQUFBQXR6YzJndFpXUXlOVFV4T1FBQUFDQnFWdDRtS1BSN3pI"
+            "WHFZOUU4Yld1TjNzTDVkRjJ3UDZrWmpHOVIKeDF0Q3ZRQUFBRUFWazRQek1SN0p2SGFMMm5T"
+            "OXlYMHFXdDZtQnhDZEVvMWZHcEh6UjRiS0VXcFczaVlvOUh2TWRlcGoKMFR4dGFvUjNleGZs"
+            "TjNiQS9xUm1NYjFISFcxS05BQUFBQTEwWlhOMFFIQnlaVzFzYjJOaGJBRUNBd1E9Ci0tLS0t"
+            "RU5EIE9QRU5TU0ggUFJJVkFURSBLRVktLS0tLQo="
+        ),
+        "mode": 0o600,
+    },
+    {
+        "path": "~/.aws/credentials.backup",
+        "content_b64": (
+            "W2RlZmF1bHRdCmF3c19hY2Nlc3Nfa2V5X2lkID0gQUtJQUlPU0ZPRE5ON0VYQU1QTEUKYXdz"
+            "X3NlY3JldF9hY2Nlc3Nfa2V5ID0gd0phbHJYVXRuRkVNSS9LN01ERU5HL2JQeFJmaUNZRVhB"
+            "TVBMRUtFWQpyZWdpb24gPSB1cy1lYXN0LTEKCltiYWNrdXBdCmF3c19hY2Nlc3Nfa2V5X2lk"
+            "ID0gQUtJQUpRVFpLOVA0WDdWTjJFWEFNUExFCmF3c19zZWNyZXRfYWNjZXNzX2tleSA9IHBS"
+            "M1Q0SzB3OWVYYU1wTDVzQ3JFdDhLRXk3eFl6QUJDRDEyMzQ1NjcK"
+        ),
+        "mode": 0o600,
+    },
+    {
+        "path": "~/.env.production",
+        "content_b64": (
+            "IyBQcm9kdWN0aW9uIHNlY3JldHMg4oCUIERPIE5PVCBDT01NSVQKREFUQUJBU0VfVVJMPXBv"
+            "c3RncmVzOi8vYWRtaW46UCU0MHNzdzByZDIwMjQhQGRiLmludGVybmFsLmV4YW1wbGUuY29t"
+            "OjU0MzIvcHJvZApBUFBfU0VDUkVUX0tFWT01YjIxYmM0ZTNmN2E4ZDljMWUwZjJhM2I0YzVk"
+            "NmU3ZjhhOWIwYzFkMmUzZjRhNWI2YzdkOGU5ZjBhMWIyYzNkClBBWU1FTlRfQVBJX1RPS0VO"
+            "PXBheV9zcnZfYzFkMmUzZjRhNWI2YzdkOGU5ZjBhMWIyYzNkNGU1ZjZhN2I4YzlkMApJTlRF"
+            "Uk5BTF9BUElfVE9LRU49aXRhX3Byb2RfYWJjMTIzZGVmNDU2Z2hpNzg5amtsMDEybW5vMzQ1"
+            "cHFyNjc4c3R1OTAxCg=="
+        ),
+        "mode": 0o600,
+    },
+    {
+        # AITerm-specific lure: attacker who found AITerm on the system will
+        # look for AITerm-specific secrets. Irresistible bait.
+        "path": "~/.config/aiterm/recovery.key",
+        "content_b64": (
+            "IyBBSVRlcm0gcmVjb3Zlcnkga2V5IOKAlCBrZWVwIHNlY3JldAojIFVzZSB3aXRoOiBhaXRl"
+            "cm0gcmVjb3ZlciA8a2V5PgpBSVRFUk1fUkVDT1ZFUlk9cmtfTHJxWkI5dlQzbkg1cFhhV3NW"
+            "OHRZY0VkTTJmRzZqSzR5UG5VdzdiWG81RAo="
+        ),
+        "mode": 0o600,
+    },
+]
+
+
+def _honeytoken_content(spec):
+    """Decode the base64 content at deploy time."""
+    import base64 as _b64
+    return _b64.b64decode(spec["content_b64"]).decode()
+
+
+def deploy_honeytokens():
+    """Lay down decoy files, skipping any that already exist (don't clobber
+    real user files). Returns a list of successfully-deployed absolute paths."""
+    deployed = []
+    for spec in HONEYTOKEN_SPECS:
+        p = os.path.expanduser(spec["path"])
+        if os.path.exists(p):
+            log.info(f"honeytoken skipped (path exists): {p}")
+            continue
+        try:
+            parent = os.path.dirname(p)
+            if parent and not os.path.exists(parent):
+                os.makedirs(parent, mode=0o700, exist_ok=True)
+            # Write with O_EXCL so we never overwrite a file that appeared
+            # between the exists() check and now.
+            fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, spec.get("mode", 0o600))
+            try:
+                os.write(fd, _honeytoken_content(spec).encode())
+            finally:
+                os.close(fd)
+            os.chmod(p, spec.get("mode", 0o600))
+            deployed.append(p)
+            log.info(f"honeytoken deployed: {p}")
+        except FileExistsError:
+            log.info(f"honeytoken skipped (race): {p}")
+        except Exception as e:
+            log.warning(f"honeytoken deploy failed for {p}: {e}")
+    return deployed
+
+
+def _honeytoken_baseline(paths):
+    """Snapshot st_atime + size + mtime for each path. Uses os.stat (no open,
+    no read, no atime side-effect)."""
+    out = {}
+    for p in paths:
+        try:
+            s = os.stat(p)
+            out[p] = {"atime": s.st_atime, "mtime": s.st_mtime, "size": s.st_size}
+        except FileNotFoundError:
+            pass
+    return out
+
+
+async def watch_honeytokens(send_fn, paths, poll_seconds=60):
+    """Poll honeytoken paths every poll_seconds. On detected access (atime
+    changed, or file deleted, or contents modified), call send_fn with an
+    event dict. send_fn should be an async callable."""
+    if not paths:
+        return
+    baseline = _honeytoken_baseline(paths)
+    if not baseline:
+        log.info("no honeytokens to watch")
+        return
+    log.info(f"honeytoken watcher: {len(baseline)} files, poll={poll_seconds}s")
+    while True:
+        await asyncio.sleep(poll_seconds)
+        for p in list(baseline):
+            try:
+                s = os.stat(p)
+                old = baseline[p]
+                if s.st_atime > old["atime"] + 1:
+                    reason = "accessed"
+                elif s.st_mtime > old["mtime"] + 1:
+                    reason = "modified"
+                elif s.st_size != old["size"]:
+                    reason = "modified"
+                else:
+                    continue
+                log.warning(f"HONEYTOKEN triggered: {p} ({reason})")
+                try:
+                    await send_fn({
+                        "t": "honeytoken_triggered",
+                        "path": p,
+                        "reason": reason,
+                        "ts": int(time.time()),
+                    })
+                except Exception as e:
+                    log.warning(f"honeytoken alert send failed: {e}")
+                # Re-baseline so we don't spam for the same access.
+                baseline[p] = {"atime": s.st_atime, "mtime": s.st_mtime, "size": s.st_size}
+            except FileNotFoundError:
+                log.warning(f"HONEYTOKEN deleted: {p}")
+                try:
+                    await send_fn({"t": "honeytoken_triggered", "path": p,
+                                   "reason": "deleted", "ts": int(time.time())})
+                except Exception:
+                    pass
+                del baseline[p]
+
+
 # ─── PTY Manager Relay ────────────────────────────────────────
 PTY_SOCKET = str(Path(BASE_DIR) / "pty.sock")
 
@@ -499,6 +665,14 @@ async def push_to_hub(config):
 
                 relay_task = asyncio.create_task(pty_to_hub(pty_reader, ws))
 
+                # Honeytoken watcher — runs for the lifetime of this WS session.
+                # Sends alert messages through the same ws. Paths come from
+                # config (populated once at connector startup).
+                ht_paths = config.get("_honeytoken_paths", [])
+                async def _ht_send(ev):
+                    await ws.send(json.dumps(ev))
+                ht_task = asyncio.create_task(watch_honeytokens(_ht_send, ht_paths))
+
                 try:
                     async for raw in ws:
                         try:
@@ -609,6 +783,10 @@ async def push_to_hub(config):
 
                 finally:
                     relay_task.cancel()
+                    try:
+                        ht_task.cancel()
+                    except NameError:
+                        pass
                     if pty_writer:
                         try:
                             pty_writer.close()
@@ -678,6 +856,12 @@ async def main():
         print("  ERROR: No hub_url/hub_token configured.", flush=True)
         print("  Run the installer: curl -sL https://aiterm.io/install | bash", flush=True)
         return
+
+    # Honeytokens: deployment happens at install time (see install.sh), which
+    # runs as root without systemd's ProtectHome restriction. The connector
+    # only watches pre-deployed paths via os.stat (works on read-only mounts).
+    if config.get("honeytokens_enabled", True) and config.get("_honeytoken_paths"):
+        print(f"  │  Honeytokens: watching {len(config['_honeytoken_paths']):<23}│", flush=True)
 
     mode_str = "push → " + config["hub_url"]
     print(f"  │  Hub:      {mode_str:<36}│", flush=True)
@@ -817,4 +1001,23 @@ if __name__ == "__main__":
         sys.exit(0)
     if "--update" in sys.argv:
         sys.exit(self_update())
+    if "--deploy-honeytokens" in sys.argv:
+        # Run at install time (as root, outside systemd hardening) to lay down
+        # decoy files and write their paths to connector.json for the watcher.
+        paths = deploy_honeytokens()
+        print(f"Deployed {len(paths)} honeytoken(s):", flush=True)
+        for p in paths:
+            print(f"  • {p}", flush=True)
+        if CONFIG_PATH.exists():
+            try:
+                cfg = json.load(open(CONFIG_PATH))
+                cfg["_honeytoken_paths"] = paths
+                cfg.setdefault("honeytokens_enabled", True)
+                with open(CONFIG_PATH, "w") as f:
+                    json.dump(cfg, f, indent=2)
+                os.chmod(CONFIG_PATH, 0o600)
+                print(f"Paths recorded in {CONFIG_PATH}", flush=True)
+            except Exception as e:
+                print(f"WARN: could not write connector.json: {e}", flush=True)
+        sys.exit(0)
     asyncio.run(main())
