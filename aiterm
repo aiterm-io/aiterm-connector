@@ -24,6 +24,7 @@ fi
 case "${1:-}" in
   update)   exec $PY "$DIR/connector.py" --update ;;
   scan)     exec $PY "$DIR/connector.py" --scan ;;
+  doctor)   shift; exec $PY "$DIR/doctor.py" "$@" ;;
   pair|repair)
     # Re-pair this machine with a fresh token (keeps the name, keeps code,
     # restores old pairing if the flow fails). Use when the machine was
@@ -175,6 +176,7 @@ print(f\"  Dir:   $DIR\")
     echo "  aiterm update      Update connector from server"
     echo "  aiterm pair        Re-pair this machine (new token, keeps name)"
     echo "  aiterm scan        Scan for AI backends"
+    echo "  aiterm doctor      Server security checkup (read-only)"
     echo "  aiterm logs        Show recent logs"
     echo "  aiterm logs 100    Show last 100 log entries"
     echo "  aiterm uninstall   Remove connector completely"
