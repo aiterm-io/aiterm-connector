@@ -521,17 +521,60 @@ async def handle_client(reader, writer):
                         continue
                     if ext_pid and force:
                         own_pids = {s.pid for s in sessions.values() if s.pid}
+                        # Owned-by-this-PTY-Manager: easy case, kill it.
                         if ext_pid in own_pids:
                             log.info(f"Force-killing own session PID {ext_pid} in {cwd}")
                             try:
                                 os.kill(ext_pid, signal.SIGTERM)
+                                # Give it 500 ms to exit cleanly, then SIGKILL.
+                                for _ in range(10):
+                                    await asyncio.sleep(0.05)
+                                    try:
+                                        os.kill(ext_pid, 0)  # exists?
+                                    except ProcessLookupError:
+                                        break
+                                else:
+                                    os.kill(ext_pid, signal.SIGKILL)
                             except (ProcessLookupError, PermissionError):
                                 pass
                         else:
-                            log.warning(f"Cannot kill external PID {ext_pid}")
-                            resp = {"t": "process_conflict", "sid": sid, "ai": ai_type,
-                                    "pid": ext_pid, "cwd": cwd,
-                                    "m": f"External process (PID {ext_pid}) is running. Run: kill {ext_pid}"}
+                            # Not in our sessions dict → orphan from a previous
+                            # PTY-Manager OR a manually-started AI in the same
+                            # cwd. With explicit force, we kill it if:
+                            #   * it's owned by the same UID as PTY-Manager
+                            #     (no privilege escalation; we kill OUR user's
+                            #     processes only), AND
+                            #   * find_running_process already verified it's a
+                            #     known AI binary in the target cwd (so we're
+                            #     not zapping random system processes).
+                            # The user explicitly chose "force" — that's their
+                            # informed consent to clean up THIS process.
+                            ok_to_kill = False
+                            try:
+                                st = os.stat(f"/proc/{ext_pid}")
+                                if st.st_uid == os.getuid():
+                                    ok_to_kill = True
+                            except (FileNotFoundError, PermissionError):
+                                pass
+                            if ok_to_kill:
+                                log.warning(f"Force-killing same-UID AI PID {ext_pid} in {cwd} (user requested)")
+                                try:
+                                    os.kill(ext_pid, signal.SIGTERM)
+                                    for _ in range(10):
+                                        await asyncio.sleep(0.05)
+                                        try:
+                                            os.kill(ext_pid, 0)
+                                        except ProcessLookupError:
+                                            break
+                                    else:
+                                        os.kill(ext_pid, signal.SIGKILL)
+                                except (ProcessLookupError, PermissionError) as e:
+                                    log.warning(f"force kill failed: {e}")
+                            else:
+                                log.warning(f"Refusing to kill PID {ext_pid} — different UID")
+                                resp = {"t": "process_conflict", "sid": sid, "ai": ai_type,
+                                        "pid": ext_pid, "cwd": cwd,
+                                        "m": f"External process (PID {ext_pid}) belongs to another user. Run: kill {ext_pid}"}
                             writer.write((json.dumps(resp) + "\n").encode())
                             await writer.drain()
                             continue
