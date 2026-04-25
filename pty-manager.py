@@ -601,6 +601,28 @@ async def handle_client(reader, writer):
                 writer.write((json.dumps(resp) + "\n").encode())
                 await writer.drain()
 
+            elif t == "kill_all":
+                # Emergency stop — kill every session right now. Used by the
+                # per-user "panic" button. Reports each kill so the dashboard
+                # updates its tab list. SIGTERM first, kernel will reap.
+                killed_sids = list(sessions.keys())
+                log.warning(f"KILL_ALL received — terminating {len(killed_sids)} session(s)")
+                for sid_kill in killed_sids:
+                    sess = sessions.pop(sid_kill, None)
+                    if sess:
+                        try:
+                            sess.kill()
+                        except Exception as e:
+                            log.warning(f"kill({sid_kill}) failed: {e}")
+                        try:
+                            writer.write((json.dumps({"t": "stopped", "sid": sid_kill}) + "\n").encode())
+                        except Exception:
+                            pass
+                try:
+                    await writer.drain()
+                except Exception:
+                    pass
+
             elif t == "input":
                 sess = sessions.get(sid)
                 if sess:
