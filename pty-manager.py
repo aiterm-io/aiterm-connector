@@ -379,6 +379,36 @@ EXTRA_PATHS = {
 }
 
 
+def _process_context(pid):
+    """Best-effort metadata about a PID for the conflict UI: how long it has
+    been running, who its parent looks like, and whether we recognise it as
+    one of our own sessions. Used only to make the dashboard's 'something
+    is already there' modal informative — never for security decisions."""
+    out = {"pid": pid, "started_at": None, "parent_pid": None,
+           "parent_cmd": "", "uid": None}
+    try:
+        st = os.stat(f"/proc/{pid}")
+        out["uid"] = st.st_uid
+        out["started_at"] = int(st.st_ctime)
+    except (FileNotFoundError, PermissionError):
+        return out
+    try:
+        with open(f"/proc/{pid}/status") as f:
+            for ln in f:
+                if ln.startswith("PPid:"):
+                    out["parent_pid"] = int(ln.split()[1])
+                    break
+    except Exception:
+        pass
+    if out["parent_pid"]:
+        try:
+            with open(f"/proc/{out['parent_pid']}/cmdline", "rb") as f:
+                out["parent_cmd"] = f.read().decode(errors="replace").replace("\x00", " ").strip()[:200]
+        except Exception:
+            pass
+    return out
+
+
 def find_running_process(binary_name, target_cwd):
     """Check /proc for a running INTERACTIVE process matching binary_name in target_cwd.
     Excludes daemon/server processes (e.g. 'ollama serve')."""
@@ -513,9 +543,12 @@ async def handle_client(reader, writer):
                     ext_pid = find_running_process(bin_name, cwd)
                     if ext_pid and not force:
                         ai_name = "Claude Code" if ai_base == "claude" else ai_base.title()
+                        ctx = _process_context(ext_pid)
+                        is_ours = ext_pid in {s.pid for s in sessions.values() if s.pid}
                         resp = {"t": "process_conflict", "sid": sid, "ai": ai_type,
                                 "pid": ext_pid, "cwd": cwd,
-                                "m": f"{ai_name} already running in {cwd} (PID {ext_pid})"}
+                                "m": f"{ai_name} already running in {cwd} (PID {ext_pid})",
+                                "ctx": {**ctx, "is_ours": is_ours, "ai_name": ai_name}}
                         writer.write((json.dumps(resp) + "\n").encode())
                         await writer.drain()
                         continue
