@@ -554,11 +554,21 @@ async def pty_relay(ws, config):
 
 
 async def push_to_hub(config):
-    """Connect to hub, relay to PTY manager. Connector is thin."""
+    """Connect to hub, relay to PTY manager. Connector is thin.
+
+    Auth-failure retry uses exponential backoff (30 s → 30 min cap). Without
+    this, a stale token causes the connector to retry every 30 s, generating
+    one `connector_invalid_token` security-log entry per try. With fail2ban's
+    aiterm jail at maxretry=5/findtime=10min, the customer's own Public-IP
+    gets banned by their own connector within 2-3 minutes — they then
+    can't reach aiterm.io at all from that machine until the bantime expires.
+    Backoff prevents the trap; user sees the clear log message and runs
+    `aiterm pair` to fix the underlying token issue."""
     hub_url = config["hub_url"]
     hub_token = config["hub_token"]
     upload_dir = Path(config["upload_dir"])
 
+    auth_fail_count = 0  # consecutive auth failures
     while True:
         try:
             ssl_ctx = None
@@ -598,9 +608,21 @@ async def push_to_hub(config):
                 await ws.send(json.dumps({"t": "auth", "token": hub_token}))
                 resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
                 if not resp.get("ok"):
-                    log.error("Hub auth failed")
-                    await asyncio.sleep(30)
+                    auth_fail_count += 1
+                    # Exponential backoff: 30 → 60 → 120 → 240 → 480 → 900 → 1800 (cap).
+                    backoff = min(30 * (2 ** (auth_fail_count - 1)), 1800)
+                    log.error(
+                        f"Hub auth failed (attempt #{auth_fail_count}). "
+                        f"The token in connector.json is rejected by the hub. "
+                        f"This usually means the machine was removed from the "
+                        f"dashboard or the user account was deleted. "
+                        f"Run 'aiterm pair' on this machine to get a fresh token. "
+                        f"Retrying in {backoff}s."
+                    )
+                    await asyncio.sleep(backoff)
                     continue
+                # Auth succeeded → reset the backoff counter.
+                auth_fail_count = 0
 
                 # Info
                 await ws.send(json.dumps({
