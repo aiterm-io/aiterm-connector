@@ -190,6 +190,12 @@ SVCEOF
     CONN_NEW=$(md5sum "$SVC_DIR/aiterm-connector.service" 2>/dev/null | awk '{print $1}')
     [ "$PTY_OLD" != "$PTY_NEW" ] && PTY_UNIT_CHANGED=1
     [ "$CONN_OLD" != "$CONN_NEW" ] && CONN_UNIT_CHANGED=1
+    # Force success exit. Otherwise — if both unit files are byte-identical
+    # to the previous install — the trailing `[ ] && ...` returns 1 and the
+    # function inherits that as its exit code, which trips `set -e` at the
+    # call site even though nothing actually went wrong. Bash's "&& list"
+    # exemption only applies inside the function body, not to its return.
+    return 0
 }
 
 # Signed-download helper. Verifies Ed25519-signed manifest + per-file SHA-256
