@@ -12,7 +12,7 @@ Usage:
 Requires: pip3 install websockets
 """
 
-CONNECTOR_VERSION = "2026.04.26.1"
+CONNECTOR_VERSION = "2026.04.26.2"
 
 # Ed25519 public key for manifest signature verification. Updates whose
 # manifest.sig does not verify against this key are rejected. Rotation
@@ -45,7 +45,33 @@ log = logging.getLogger("connector")
 # ─── Paths ───────────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent.resolve()
 CONFIG_PATH = BASE_DIR / "connector.json"
-ALLOWED_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".pdf", ".webm", ".ogg", ".mp3", ".wav", ".m4a"}  # No .svg — XSS risk
+ALLOWED_EXT = {
+    # Images
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp",
+    # Documents / audio (Claude can transcribe / OCR)
+    ".pdf", ".webm", ".ogg", ".mp3", ".wav", ".m4a",
+    # Plain text & docs — the most common upload for AI workflows
+    ".txt", ".md", ".rst", ".tex", ".log", ".csv", ".tsv",
+    # Structured data / config
+    ".json", ".yaml", ".yml", ".toml", ".xml", ".ini", ".conf", ".cfg", ".properties",
+    # Source code (broad set; uploads are not executed, just stored)
+    ".py", ".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs",
+    ".html", ".htm", ".css", ".scss", ".sass", ".less",
+    ".sh", ".bash", ".zsh", ".fish", ".ps1",
+    ".rb", ".go", ".rs", ".java", ".kt", ".scala", ".swift",
+    ".c", ".h", ".cpp", ".hpp", ".cc", ".cs",
+    ".php", ".pl", ".lua", ".sql", ".r", ".dart", ".ex", ".exs",
+    ".vue", ".svelte",
+    # Diff / patch
+    ".diff", ".patch",
+    # Notebooks
+    ".ipynb",
+    # Excluded on purpose:
+    #   .svg          — embeds scripts (stored XSS if ever served as HTML)
+    #   .env / .pem   — secrets; user can rename if they really mean it
+    #   .exe / .dll / .msi / .app / .apk / .ipa / .so / .dylib — binaries
+    #   .zip / .tar / .gz — archives can hide anything; expand on host instead
+}
 
 # ─── Scanner ─────────────────────────────────────────────────
 def scan_project_dirs(max_results=25):
