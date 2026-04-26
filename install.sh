@@ -720,8 +720,12 @@ ok "Configuration saved (0600)"
 # watch them and alert the hub on any read. Runs here (not from the service)
 # because systemd's ProtectHome=read-only blocks /root + /home writes.
 if python3 "$INSTALL_DIR/connector.py" --deploy-honeytokens > /tmp/aiterm-honeytokens.log 2>&1; then
-    HT_COUNT=$(grep -c '^  •' /tmp/aiterm-honeytokens.log || echo 0)
-    if [ "$HT_COUNT" -gt 0 ]; then
+    # grep -c prints "0" AND exits 1 when no match. With "|| echo 0" appended
+    # the capture becomes "0\n0", which makes "[ -gt 0 ]" choke. Just count
+    # lines manually — defensive against grep-empty output.
+    HT_COUNT=$(grep -c '^  •' /tmp/aiterm-honeytokens.log 2>/dev/null)
+    [ -z "$HT_COUNT" ] && HT_COUNT=0
+    if [ "$HT_COUNT" -gt 0 ] 2>/dev/null; then
         ok "Honeytokens deployed ($HT_COUNT decoys — any access triggers an alert)"
     fi
     rm -f /tmp/aiterm-honeytokens.log
