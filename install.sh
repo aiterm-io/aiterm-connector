@@ -680,7 +680,6 @@ if [ -z "$DEFAULT_CWD" ]; then
         HOME_DEFAULT=$(eval echo ~)
         printf "  ${CYAN}%2d${NC}  %s  ${DIM}(home directory)${NC}\n" "$IDX" "$HOME_DEFAULT"
         CAND_LIST+=("$HOME_DEFAULT")
-        HOME_IDX="$IDX"
         echo ""
         echo -ne "  Select working directory [1]: "
         CHOICE=""

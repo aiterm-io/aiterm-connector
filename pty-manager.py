@@ -10,17 +10,13 @@ Protocol: newline-delimited JSON over Unix socket.
 
 import asyncio
 import base64
-import fcntl
 import json
 import logging
 import os
-import pty
 import re
 import shutil
 import signal
 import struct
-import sys
-import termios
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SCROLLBACK_MAX = 200 * 1024  # 200KB per session
@@ -90,7 +86,7 @@ def guard_check(line: str, piloted: bool = False):
     """Return (True, reason) if the command line matches a dangerous pattern,
     else (False, None). When `piloted` is True, also enforce 'piloted'-scope
     patterns — the bar is stricter when AI drives AI."""
-    for rx, reason, sev, scope in _load_guard_patterns():
+    for rx, reason, _sev, scope in _load_guard_patterns():
         if scope == "piloted" and not piloted:
             continue
         if rx.search(line):
@@ -166,7 +162,8 @@ class PtySession:
             except (BlockingIOError, OSError) as e:
                 last_err = e
                 # Block briefly so we don't spin
-                import time as _t; _t.sleep(0.02)
+                import time as _t
+                _t.sleep(0.02)
         else:
             raise RuntimeError(f"could not connect to supervisor at {sock_path}: {last_err}")
         self.sock = s
