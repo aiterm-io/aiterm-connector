@@ -87,6 +87,14 @@ ExecStart=/usr/bin/python3 $INSTALL_DIR/pty-manager.py
 WorkingDirectory=$INSTALL_DIR
 Restart=always
 RestartSec=3
+# KillMode=process — only signal pty-manager itself on stop/restart.
+# Per-session supervisors (session_daemon) double-fork out of the cgroup
+# but mind: with the systemd default (control-group) those orphaned
+# children would still receive SIGTERM. process mode keeps them alive
+# so AI sessions survive a pty-manager restart.
+KillMode=process
+SendSIGKILL=yes
+TimeoutStopSec=10
 # Hardening (minimal: must spawn user shells with full fs access & setuid/sudo)
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
@@ -134,6 +142,11 @@ ExecStart=/usr/bin/python3 $INSTALL_DIR/pty-manager.py
 WorkingDirectory=$INSTALL_DIR
 Restart=always
 RestartSec=3
+# KillMode=process — keep per-session supervisors alive when pty-manager
+# itself restarts. See system-mode unit above for the full reasoning.
+KillMode=process
+SendSIGKILL=yes
+TimeoutStopSec=10
 # Hardening (minimal: must spawn user shells)
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
@@ -737,30 +750,36 @@ fi
 info "Setting up services..."
 
 write_units
-$SVC_CMD daemon-reload 2>/dev/null
+# Every systemctl/loginctl call below is shielded with `|| true` because
+# the post-restart `is-active` check at the bottom of this block is the
+# authoritative success test. Without the shield, a transient failure
+# (unrelated unit broken on the host, brief activation race, etc.) trips
+# `set -e` and the EXIT trap rolls back a *successful* re-pair — the
+# customer ends up with their old token even though pairing went fine.
+$SVC_CMD daemon-reload 2>/dev/null || true
 
 if [ "$MODE" = "system" ]; then
     if systemctl is-active --quiet aiterm-connector 2>/dev/null; then
-        systemctl restart aiterm-pty aiterm-connector 2>/dev/null
+        systemctl restart aiterm-pty aiterm-connector 2>/dev/null || true
         ok "Services restarted (were already running)"
     else
-        systemctl enable --now aiterm-pty 2>/dev/null
+        systemctl enable --now aiterm-pty 2>/dev/null || true
         sleep 1
-        systemctl enable --now aiterm-connector 2>/dev/null
+        systemctl enable --now aiterm-connector 2>/dev/null || true
     fi
 else
     if $SVC_CMD is-active --quiet aiterm-connector 2>/dev/null; then
-        $SVC_CMD restart aiterm-pty aiterm-connector 2>/dev/null
+        $SVC_CMD restart aiterm-pty aiterm-connector 2>/dev/null || true
         ok "Services restarted (were already running)"
     else
-        $SVC_CMD enable --now aiterm-pty 2>/dev/null
+        $SVC_CMD enable --now aiterm-pty 2>/dev/null || true
         sleep 1
-        $SVC_CMD enable --now aiterm-connector 2>/dev/null
+        $SVC_CMD enable --now aiterm-connector 2>/dev/null || true
     fi
 
     # Enable linger so services survive logout
     LINGER_OK=0
-    loginctl enable-linger "$TARGET_USER" 2>/dev/null && LINGER_OK=1 && ok "Autostart enabled (linger)"
+    loginctl enable-linger "$TARGET_USER" 2>/dev/null && LINGER_OK=1 && ok "Autostart enabled (linger)" || true
 fi
 
 sleep 2
