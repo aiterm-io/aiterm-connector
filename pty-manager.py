@@ -112,30 +112,67 @@ def _sanitized_env():
     return env
 
 
+import session_daemon  # dtach-in-Python: per-session supervisor that holds
+                       # the PTY master FD across pty-manager restarts.
+
 class PtySession:
-    """A single PTY process (AI session)."""
+    """A single AI session, supervised by a session_daemon process.
+
+    PTY-Manager talks to that supervisor via a Unix-domain socket using a
+    tiny framed protocol (T_DATA / T_RESIZE / T_KILL / T_META_*). The AI
+    process is a child of the supervisor, NOT of pty-manager — so pty-manager
+    can die and the AI keeps running. New pty-manager instance reattaches
+    via session_daemon.discover_sessions() at startup."""
 
     def __init__(self, sid, cmd, cwd, loop, cmd_args=None, guard_enabled=False):
         self.sid = sid
         self.cmd = cmd
         self.cmd_args = cmd_args or []
         self.cwd = cwd
-        self.pid = None
-        self.fd = None
+        self.pid = None              # AI process PID (reported by daemon)
+        self.fd = None               # socket FD to the supervisor
+        self.sock = None             # the socket itself (kept for sendall)
+        self.sock_path = None        # /run/aiterm/sess_<sid>.sock
         self.scrollback = bytearray()
-        self.started_at = None  # set on spawn
+        self._sock_rbuf = bytearray()  # frame-parsing buffer
+        self.started_at = None
         self.loop = loop
         self.clients = set()
         # Guard Mode state (active only when self.ai_base == "bash")
         self.guard_enabled = bool(guard_enabled)
-        self._guard_line = b""            # accumulator for the current input line
-        self._guard_pending = None        # pending command string while awaiting user confirmation
-        self._guard_held = b""            # data held back (terminator + any trailing bytes)
-        self._guard_cb = None             # callable(line, reason) invoked on pattern match
+        self._guard_line = b""
+        self._guard_pending = None
+        self._guard_held = b""
+        self._guard_cb = None
 
     @property
     def _is_bash(self):
         return os.path.basename(self.cmd or "") in ("bash", "sh", "zsh", "fish")
+
+    def _attach_socket(self, sock_path):
+        """Open + connect a non-blocking Unix socket to the supervisor and
+        wire it into the asyncio loop. Used by spawn() and reattach()."""
+        import socket as _socket
+        s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        s.setblocking(False)
+        # The supervisor takes a moment to bind the socket after fork —
+        # spawn() already waited up to ~600 ms for it, but on slow systems
+        # we may still need a small connect retry.
+        last_err = None
+        for _ in range(30):
+            try:
+                s.connect(sock_path)
+                break
+            except (BlockingIOError, OSError) as e:
+                last_err = e
+                # Block briefly so we don't spin
+                import time as _t; _t.sleep(0.02)
+        else:
+            raise RuntimeError(f"could not connect to supervisor at {sock_path}: {last_err}")
+        self.sock = s
+        self.fd = s.fileno()
+        self.sock_path = sock_path
+        self.loop.add_reader(self.fd, self._on_socket)
 
     def spawn(self):
         self.kill()
@@ -144,59 +181,103 @@ class PtySession:
         env = _sanitized_env()
 
         argv = [self.cmd] + self.cmd_args
-        pid, fd = pty.fork()
-        if pid == 0:
-            try:
-                os.chdir(self.cwd)
-            except Exception:
-                os.chdir(os.path.expanduser("~"))
-            os.execvpe(self.cmd, argv, env)
-            sys.exit(1)
-
-        self.pid, self.fd = pid, fd
+        # Fork supervisor + AI; daemon hands us back the AI PID and the
+        # path of the supervisor's listen-socket.
+        try:
+            sock_path, ai_pid = session_daemon.spawn(self.sid, argv, self.cwd, env)
+        except Exception as e:
+            log.error(f"session_daemon.spawn failed: {e}")
+            raise
+        self.pid = ai_pid
         self.scrollback.clear()
+        self._sock_rbuf.clear()
+        self._attach_socket(sock_path)
         self.resize(30, 120)
-        self.loop.add_reader(fd, self._on_output)
-        log.info(f"Session {self.sid}: spawned {self.cmd} in {self.cwd} (pid {pid})")
+        log.info(f"Session {self.sid}: spawned {self.cmd} in {self.cwd} via daemon (ai_pid {ai_pid})")
 
-    def kill(self):
+    def reattach(self, sock_path, meta):
+        """Connect to an already-running supervisor (after pty-manager
+        restart). meta is the JSON dict from sess_<sid>.sock.meta written
+        at spawn time — it carries cmd, cwd, started_at, ai_pid."""
+        self.cmd = (meta.get("cmd") or [self.cmd])[0] if isinstance(meta.get("cmd"), list) else (meta.get("cmd") or self.cmd)
+        cmd_field = meta.get("cmd")
+        if isinstance(cmd_field, list) and len(cmd_field) > 1:
+            self.cmd_args = cmd_field[1:]
+        self.cwd = meta.get("cwd") or self.cwd
+        self.pid = meta.get("ai_pid")
+        self.started_at = meta.get("started_at")
+        self.scrollback.clear()
+        self._sock_rbuf.clear()
+        self._attach_socket(sock_path)
+        log.info(f"Session {self.sid}: reattached to existing supervisor (ai_pid {self.pid})")
+
+    def detach(self):
+        """Close our socket to the supervisor without killing the AI.
+        Used when pty-manager itself is shutting down — the supervisor and
+        the AI keep running, ready for the next pty-manager to reattach."""
         if self.fd is not None:
             try:
                 self.loop.remove_reader(self.fd)
             except Exception:
                 pass
-        if self.pid:
+        if self.sock is not None:
             try:
-                os.kill(self.pid, signal.SIGTERM)
-                os.waitpid(self.pid, 0)
-            except (ProcessLookupError, ChildProcessError):
-                pass
-            self.pid = None
-        if self.fd is not None:
-            try:
-                os.close(self.fd)
+                self.sock.close()
             except OSError:
                 pass
-            self.fd = None
+            self.sock = None
+        self.fd = None
+
+    def kill(self):
+        """Tell the supervisor to terminate the AI, then close our socket.
+        Supervisor cleans up the socket file and exits."""
+        # Stop reading from the socket
+        if self.fd is not None:
+            try:
+                self.loop.remove_reader(self.fd)
+            except Exception:
+                pass
+        # Tell supervisor to terminate the AI; supervisor exits afterwards
+        # and unlinks the socket itself.
+        if self.sock is not None:
+            try:
+                self.sock.sendall(session_daemon.pack_frame(session_daemon.T_KILL, b""))
+            except (OSError, ConnectionError):
+                pass
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+            self.sock = None
+        self.fd = None
+        self.sock_path = None
+        self.pid = None
 
     def resize(self, rows, cols):
-        if self.fd is not None:
-            fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
-            if self.pid:
-                try:
-                    os.kill(self.pid, signal.SIGWINCH)
-                except ProcessLookupError:
-                    pass
+        if self.sock is None:
+            return
+        body = f"{int(rows)}x{int(cols)}".encode()
+        try:
+            self.sock.sendall(session_daemon.pack_frame(session_daemon.T_RESIZE, body))
+        except (OSError, ConnectionError):
+            pass
+
+    def _send_to_pty(self, data):
+        """Send raw bytes to the PTY (wraps in T_DATA frame for the
+        supervisor)."""
+        if self.sock is None:
+            return
+        try:
+            self.sock.sendall(session_daemon.pack_frame(session_daemon.T_DATA, data))
+        except (OSError, ConnectionError):
+            pass
 
     def write(self, data):
-        if self.fd is None:
+        if self.sock is None:
             return
         # Fast path: guard off, or non-bash session, or nothing to scan
         if not self.guard_enabled or not self._is_bash:
-            try:
-                os.write(self.fd, data)
-            except OSError:
-                pass
+            self._send_to_pty(data)
             return
         # Guard path: while a confirmation is pending, buffer everything
         if self._guard_pending is not None:
@@ -210,10 +291,7 @@ class PtySession:
             if b in (b"\r", b"\n"):
                 # Flush bytes BEFORE the terminator to bash (so live-echo works)
                 if i > 0:
-                    try:
-                        os.write(self.fd, data[:i])
-                    except OSError:
-                        return
+                    self._send_to_pty(data[:i])
                     self._guard_line += data[:i]
                 # Evaluate the accumulated line
                 try:
@@ -225,7 +303,6 @@ class PtySession:
                     # Hold the terminator + any trailing data
                     self._guard_pending = line_str
                     self._guard_held = data[i:]
-                    # Reset line buffer; next user input (while pending) goes to _guard_held
                     self._guard_line = b""
                     if self._guard_cb:
                         try:
@@ -234,10 +311,7 @@ class PtySession:
                             log.warning(f"guard callback failed: {e}")
                     return
                 # Safe: write terminator, keep scanning remainder
-                try:
-                    os.write(self.fd, b)
-                except OSError:
-                    return
+                self._send_to_pty(b)
                 self._guard_line = b""
                 i += 1
                 data = data[i:]
@@ -246,10 +320,7 @@ class PtySession:
                 continue
             elif b == b"\x03":  # Ctrl-C resets the line
                 self._guard_line = b""
-                try:
-                    os.write(self.fd, b)
-                except OSError:
-                    return
+                self._send_to_pty(b)
                 i += 1
                 data = data[i:]
                 n = len(data)
@@ -258,10 +329,7 @@ class PtySession:
             elif b in (b"\x08", b"\x7f"):  # backspace / delete
                 if self._guard_line:
                     self._guard_line = self._guard_line[:-1]
-                try:
-                    os.write(self.fd, b)
-                except OSError:
-                    return
+                self._send_to_pty(b)
                 i += 1
                 data = data[i:]
                 n = len(data)
@@ -272,10 +340,7 @@ class PtySession:
                 i += 1
         # No terminator in this chunk: forward everything
         if data:
-            try:
-                os.write(self.fd, data)
-            except OSError:
-                pass
+            self._send_to_pty(data)
 
     def guard_resolve(self, approve: bool):
         """Called when user responds to a guard_confirm dialog."""
@@ -285,18 +350,14 @@ class PtySession:
         held = self._guard_held
         self._guard_held = b""
         self._guard_line = b""
-        if self.fd is None:
+        if self.sock is None:
             return
-        try:
-            if approve:
-                # Release the held data (terminator + whatever followed)
-                os.write(self.fd, held)
-            else:
-                # Cancel: send Ctrl-C so bash clears its readline buffer and shows a fresh prompt.
-                # Drop the held data.
-                os.write(self.fd, b"\x03")
-        except OSError:
-            pass
+        if approve:
+            # Release the held data (terminator + whatever followed)
+            self._send_to_pty(held)
+        else:
+            # Cancel: send Ctrl-C so bash clears its readline buffer.
+            self._send_to_pty(b"\x03")
 
     def set_guard(self, enabled: bool):
         was = self.guard_enabled
@@ -306,27 +367,70 @@ class PtySession:
             self.guard_resolve(True)
 
     def is_alive(self):
+        # The AI is a child of the session_daemon supervisor, not of
+        # pty-manager — so waitpid is not applicable. Probe via /proc.
         if not self.pid:
             return False
         try:
-            return os.waitpid(self.pid, os.WNOHANG)[0] == 0
-        except ChildProcessError:
+            os.kill(self.pid, 0)
+            return True
+        except ProcessLookupError:
             return False
+        except PermissionError:
+            return True  # process exists, just not ours to signal
 
-    def _on_output(self):
+    def _on_socket(self):
+        """asyncio reader callback. Reads bytes from the supervisor socket
+        and demultiplexes into framed messages. T_DATA frames are forwarded
+        to scrollback + browser clients exactly as the old pty-FD reader
+        did. Other frame types (T_META_RESP) are absorbed silently."""
+        if self.sock is None:
+            return
         try:
-            data = os.read(self.fd, 65536)
-            if not data:
-                return
-            self.scrollback.extend(data)
-            if len(self.scrollback) > SCROLLBACK_MAX:
-                self.scrollback = self.scrollback[-SCROLLBACK_MAX:]
-            asyncio.ensure_future(self._broadcast(data))
-        except OSError:
+            chunk = self.sock.recv(65536)
+        except (BlockingIOError, InterruptedError):
+            return
+        except (OSError, ConnectionError):
+            self._handle_supervisor_gone()
+            return
+        if not chunk:
+            self._handle_supervisor_gone()
+            return
+        self._sock_rbuf.extend(chunk)
+        # Drain complete frames.
+        while len(self._sock_rbuf) >= 5:
+            length = struct.unpack(">I", self._sock_rbuf[1:5])[0]
+            if length > 16 * 1024 * 1024:
+                # Malformed framing — drop everything to resync.
+                log.warning(f"sess {self.sid}: malformed frame length {length}, resetting buffer")
+                self._sock_rbuf.clear()
+                break
+            if len(self._sock_rbuf) < 5 + length:
+                break
+            ftype = self._sock_rbuf[0]
+            body = bytes(self._sock_rbuf[5:5 + length])
+            del self._sock_rbuf[:5 + length]
+            if ftype == session_daemon.T_DATA:
+                self.scrollback.extend(body)
+                if len(self.scrollback) > SCROLLBACK_MAX:
+                    self.scrollback = self.scrollback[-SCROLLBACK_MAX:]
+                asyncio.ensure_future(self._broadcast(body))
+            # T_META_RESP and others: ignored here; reattach() handles those.
+
+    def _handle_supervisor_gone(self):
+        """Supervisor socket closed → AI exited. Clean up reader, mark dead."""
+        try:
+            self.loop.remove_reader(self.fd)
+        except Exception:
+            pass
+        if self.sock:
             try:
-                self.loop.remove_reader(self.fd)
-            except Exception:
+                self.sock.close()
+            except OSError:
                 pass
+        self.sock = None
+        self.fd = None
+        self.pid = None
 
     async def _broadcast(self, data):
         msg = json.dumps({"t": "o", "sid": self.sid, "d": base64.b64encode(data).decode()}) + "\n"
@@ -826,6 +930,49 @@ async def _watch_registries(loop):
             await asyncio.sleep(10)
 
 
+def _reattach_existing_sessions(loop):
+    """Scan /run/aiterm/ for supervisor sockets surviving a previous
+    pty-manager run. For each live one, recreate a PtySession entry and
+    connect — the AI process keeps running throughout."""
+    try:
+        found = session_daemon.discover_sessions()
+    except Exception as e:
+        log.warning(f"reattach scan failed: {e}")
+        return 0
+    n = 0
+    for s in found:
+        if not s["ai_alive"]:
+            continue
+        meta = s["meta"] or {}
+        sid = s["sid"]
+        if sid in sessions:
+            continue
+        cmd_field = meta.get("cmd") or []
+        if isinstance(cmd_field, list) and cmd_field:
+            cmd = cmd_field[0]
+            cmd_args = cmd_field[1:]
+        else:
+            cmd = "bash"
+            cmd_args = []
+        cwd = meta.get("cwd") or os.path.expanduser("~")
+        sess = PtySession(sid, cmd, cwd, loop, cmd_args=cmd_args)
+        try:
+            sess.reattach(s["sock_path"], meta)
+            sessions[sid] = sess
+            n += 1
+            log.info(f"reattached session {sid} (ai_pid={meta.get('ai_pid')}, cwd={cwd})")
+        except Exception as e:
+            log.warning(f"reattach {sid} failed: {e}")
+    # Drop stale socket files where the supervisor crashed without cleaning up.
+    try:
+        cleaned = session_daemon.cleanup_dead_sessions()
+        if cleaned:
+            log.info(f"cleaned {cleaned} stale session socket(s)")
+    except Exception:
+        pass
+    return n
+
+
 async def main():
     # Clean up old socket
     if os.path.exists(SOCKET_PATH):
@@ -848,17 +995,25 @@ async def main():
     # even without an explicit signal.
     watcher_task = asyncio.create_task(_watch_registries(loop))
 
-    log.info(f"PTY Manager ready on {SOCKET_PATH} (multi-session, hot-reload armed)")
+    # Reattach supervisor processes from a previous pty-manager run. Their
+    # AI children kept running while we were down; we just plug back in.
+    reattached = _reattach_existing_sessions(loop)
+    if reattached:
+        log.info(f"PTY Manager ready on {SOCKET_PATH} — reattached {reattached} live session(s)")
+    else:
+        log.info(f"PTY Manager ready on {SOCKET_PATH} (multi-session, hot-reload armed)")
     await stop
 
-    # Cleanup
+    # Graceful shutdown: DETACH all sessions instead of killing them.
+    # The supervisor processes keep running with the AI children attached;
+    # the next pty-manager instance will reattach. Survives its own updates.
     watcher_task.cancel()
     for sess in sessions.values():
-        sess.kill()
+        sess.detach()
     server.close()
     if os.path.exists(SOCKET_PATH):
         os.unlink(SOCKET_PATH)
-    log.info("Shutdown")
+    log.info("Shutdown — sessions detached, supervisors keep running")
 
 
 if __name__ == "__main__":

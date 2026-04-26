@@ -194,6 +194,7 @@ api_url, install_dir, bin_dir = sys.argv[1:4]
 FILES = [
     ("connector.py",         f"{install_dir}/connector.py"),
     ("pty-manager.py",       f"{install_dir}/pty-manager.py"),
+    ("session_daemon.py",    f"{install_dir}/session_daemon.py"),
     ("doctor.py",            f"{install_dir}/doctor.py"),
     ("registry_loader.py",   f"{install_dir}/registry_loader.py"),
     ("aiterm",               f"{bin_dir}/aiterm"),

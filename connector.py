@@ -967,6 +967,12 @@ def self_update():
     files = [
         ("connector.py", install_dir / "connector.py"),
         ("pty-manager.py", install_dir / "pty-manager.py"),
+        ("session_daemon.py", install_dir / "session_daemon.py"),
+        ("registry_loader.py", install_dir / "registry_loader.py"),
+        ("doctor.py", install_dir / "doctor.py"),
+        ("ai-registry.json", install_dir / "ai-registry.json"),
+        ("guard-patterns.json", install_dir / "guard-patterns.json"),
+        ("doctor-checks.json", install_dir / "doctor-checks.json"),
         ("aiterm", bin_dir / "aiterm"),
     ]
 
