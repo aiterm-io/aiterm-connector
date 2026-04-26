@@ -21,6 +21,27 @@ if [ "$SVC" = "systemctl --user" ]; then
     $SVC is-system-running &>/dev/null || SVC_WORKS=0
 fi
 
+# Print PIDs of pty-manager / connector instances that are *not* the
+# process systemd is tracking. These "strangers" come from someone
+# running `aiterm start` (or `python3 pty-manager.py`) by hand while
+# the service was already up — systemctl won't reach them on stop or
+# restart, and they end up double-bound to pty.sock and competing with
+# the legitimate process. The hub then sees malformed/duplicate frames
+# and starts dropping connections with 1011. Caller decides what to do
+# with the list (status: warn; restart: kill).
+find_strangers() {
+    [ "$SVC_WORKS" -eq 1 ] || return 0
+    local kind="$1" script main pid
+    case "$kind" in
+        pty)        script="$DIR/pty-manager.py";  main=$($SVC show -p MainPID --value aiterm-pty 2>/dev/null || echo 0) ;;
+        connector)  script="$DIR/connector.py";    main=$($SVC show -p MainPID --value aiterm-connector 2>/dev/null || echo 0) ;;
+        *) return 0 ;;
+    esac
+    for pid in $(pgrep -f "python3.*$script" 2>/dev/null); do
+        [ "$pid" != "$main" ] && [ -n "$pid" ] && echo "$pid"
+    done
+}
+
 case "${1:-}" in
   update)   exec $PY "$DIR/connector.py" --update ;;
   scan)     exec $PY "$DIR/connector.py" --scan ;;
@@ -42,6 +63,18 @@ case "${1:-}" in
           echo -e "  \033[0;31m●\033[0m $svc ($STATE)"
         fi
       done
+      # Surface stranger processes — the failure mode is silent otherwise:
+      # systemctl reports green while a parallel pty-manager is corrupting
+      # the hub session.
+      pty_strangers=$(find_strangers pty)
+      conn_strangers=$(find_strangers connector)
+      if [ -n "$pty_strangers" ] || [ -n "$conn_strangers" ]; then
+        echo ""
+        echo -e "  \033[0;33m!\033[0m Stranger processes detected (running outside systemd):"
+        [ -n "$pty_strangers" ]  && echo "      pty-manager: $pty_strangers"
+        [ -n "$conn_strangers" ] && echo "      connector:   $conn_strangers"
+        echo "      Run 'aiterm restart' to clean up."
+      fi
     else
       if pgrep -f "python3.*$DIR/pty-manager.py" &>/dev/null; then
         echo -e "  \033[0;32m●\033[0m pty-manager"
@@ -67,26 +100,44 @@ print(f\"  Dir:   $DIR\")
     fi
     ;;
   start)
-    if pgrep -f "python3.*$DIR/connector.py" &>/dev/null; then
-      echo -e "  \033[0;33m!\033[0m Connector already running."
-      echo "  Use 'aiterm restart' to restart."
-    elif [ "$SVC_WORKS" -eq 1 ]; then
-      $SVC start aiterm-pty aiterm-connector 2>/dev/null && echo "  Started." || {
-        echo "  Service start failed. Starting manually..."
-        nohup $PY "$DIR/pty-manager.py" >> "$DIR/connector.log" 2>&1 &
-        sleep 1
-        nohup $PY "$DIR/connector.py" >> "$DIR/connector.log" 2>&1 &
-        echo -e "  \033[0;32m●\033[0m Started"
-      }
+    # Refuse to spawn duplicates — that's how parallel pty-managers
+    # double-bind to pty.sock and corrupt sessions. Always check both
+    # processes first and prefer systemd's idempotent start when it
+    # owns the unit. Pure manual mode also checks before nohup.
+    pty_alive=0
+    conn_alive=0
+    pgrep -f "python3.*$DIR/pty-manager.py" &>/dev/null && pty_alive=1
+    pgrep -f "python3.*$DIR/connector.py"   &>/dev/null && conn_alive=1
+    if [ "$SVC_WORKS" -eq 1 ]; then
+      # systemctl start is a no-op on already-active units, so it's safe
+      # to call unconditionally. Don't fall back to manual nohup if it
+      # fails — that's how strangers are born.
+      if $SVC start aiterm-pty aiterm-connector 2>/dev/null; then
+        if [ $pty_alive -eq 1 ] && [ $conn_alive -eq 1 ]; then
+          echo "  Already running."
+        else
+          echo "  Started."
+        fi
+      else
+        echo -e "  \033[0;31m✗\033[0m Service start failed. Check 'aiterm logs' and"
+        echo "      'systemctl status aiterm-pty aiterm-connector'."
+        exit 1
+      fi
     else
-      # Manual mode: start PTY manager first, then connector
-      if ! pgrep -f "python3.*$DIR/pty-manager.py" &>/dev/null; then
+      # Manual mode (no systemd available): only spawn what's missing.
+      if [ $pty_alive -eq 0 ]; then
         nohup $PY "$DIR/pty-manager.py" >> "$DIR/connector.log" 2>&1 &
         sleep 1
       fi
-      nohup $PY "$DIR/connector.py" >> "$DIR/connector.log" 2>&1 &
-      echo -e "  \033[0;32m●\033[0m Started (PTY manager + connector)"
-      echo "  Logs: aiterm logs"
+      if [ $conn_alive -eq 0 ]; then
+        nohup $PY "$DIR/connector.py"   >> "$DIR/connector.log" 2>&1 &
+      fi
+      if [ $pty_alive -eq 1 ] && [ $conn_alive -eq 1 ]; then
+        echo "  Already running."
+      else
+        echo -e "  \033[0;32m●\033[0m Started"
+        echo "  Logs: aiterm logs"
+      fi
     fi
     ;;
   stop)
@@ -100,24 +151,39 @@ print(f\"  Dir:   $DIR\")
     ;;
   restart)
     if [ "$SVC_WORKS" -eq 1 ]; then
-      $SVC restart aiterm-pty aiterm-connector 2>/dev/null && echo "  Restarted." || {
-        pkill -f "python3.*$DIR/connector.py" 2>/dev/null
-        pkill -f "python3.*$DIR/pty-manager.py" 2>/dev/null
-        rm -f "$DIR/pty.sock" 2>/dev/null
+      # Kill any stranger pty-manager / connector processes first —
+      # systemctl restart only touches the units it owns, and a
+      # parallel hand-started pty-manager would survive and keep
+      # corrupting pty.sock. Detect-and-kill makes restart idempotent.
+      pty_strangers=$(find_strangers pty)
+      conn_strangers=$(find_strangers connector)
+      if [ -n "$pty_strangers" ] || [ -n "$conn_strangers" ]; then
+        echo "  Cleaning up stale processes outside systemd..."
+        [ -n "$conn_strangers" ] && kill $conn_strangers 2>/dev/null
+        [ -n "$pty_strangers" ]  && kill $pty_strangers  2>/dev/null
         sleep 1
-        nohup $PY "$DIR/pty-manager.py" >> "$DIR/connector.log" 2>&1 &
-        sleep 1
-        nohup $PY "$DIR/connector.py" >> "$DIR/connector.log" 2>&1 &
-        echo -e "  \033[0;32m●\033[0m Restarted"
-      }
+        # Anyone still around gets SIGKILL.
+        pty_strangers=$(find_strangers pty)
+        conn_strangers=$(find_strangers connector)
+        [ -n "$conn_strangers" ] && kill -9 $conn_strangers 2>/dev/null
+        [ -n "$pty_strangers" ]  && kill -9 $pty_strangers  2>/dev/null
+      fi
+      if $SVC restart aiterm-pty aiterm-connector 2>/dev/null; then
+        echo "  Restarted."
+      else
+        echo -e "  \033[0;31m✗\033[0m Service restart failed. Check 'aiterm logs' and"
+        echo "      'systemctl status aiterm-pty aiterm-connector'."
+        exit 1
+      fi
     else
+      # Pure manual mode: kill everything matching, then start fresh.
       pkill -f "python3.*$DIR/connector.py" 2>/dev/null
       pkill -f "python3.*$DIR/pty-manager.py" 2>/dev/null
       rm -f "$DIR/pty.sock" 2>/dev/null
       sleep 1
       nohup $PY "$DIR/pty-manager.py" >> "$DIR/connector.log" 2>&1 &
       sleep 1
-      nohup $PY "$DIR/connector.py" >> "$DIR/connector.log" 2>&1 &
+      nohup $PY "$DIR/connector.py"   >> "$DIR/connector.log" 2>&1 &
       echo -e "  \033[0;32m●\033[0m Restarted (PTY manager + connector)"
     fi
     ;;
