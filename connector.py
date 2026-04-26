@@ -105,9 +105,14 @@ def scan_project_dirs(max_results=25):
         except OSError:
             continue
 
+    # Drop the .claude/ sub-dirs themselves: they're config dirs for
+    # their parent project, not stand-alone project roots. Without this
+    # the picker offers e.g. /root and /root/.claude as separate options
+    # for the same effective workspace.
     return [
         {"path": p, "signatures": sorted(sigs)}
         for p, sigs in sorted(found.items())
+        if os.path.basename(p) != ".claude"
     ]
 
 
