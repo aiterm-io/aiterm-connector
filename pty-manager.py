@@ -625,14 +625,19 @@ async def handle_client(reader, writer):
                                         os.kill(ext_pid, signal.SIGKILL)
                                 except (ProcessLookupError, PermissionError) as e:
                                     log.warning(f"force kill failed: {e}")
+                                # Successful kill — fall through and spawn the new
+                                # session below. Do NOT write resp / continue here:
+                                # `resp` would still hold the previous iteration's
+                                # value and would surface as a duplicate
+                                # process_conflict to the dashboard.
                             else:
                                 log.warning(f"Refusing to kill PID {ext_pid} — different UID")
                                 resp = {"t": "process_conflict", "sid": sid, "ai": ai_type,
                                         "pid": ext_pid, "cwd": cwd,
                                         "m": f"External process (PID {ext_pid}) belongs to another user. Run: kill {ext_pid}"}
-                            writer.write((json.dumps(resp) + "\n").encode())
-                            await writer.drain()
-                            continue
+                                writer.write((json.dumps(resp) + "\n").encode())
+                                await writer.drain()
+                                continue
 
                 # Build command: for Ollama use "ollama run <model>"
                 if ai_base == "ollama" and ai_model:
