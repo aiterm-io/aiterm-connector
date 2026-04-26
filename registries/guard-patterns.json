@@ -1,0 +1,172 @@
+{
+  "version": 1,
+  "updated": "2026-04-25",
+  "$comment": [
+    "Guard Mode pattern registry. PTY-Manager loads this on startup and",
+    "re-checks for changes on the AI-registry refresh cycle.",
+    "",
+    "When a new attack vector emerges, add a pattern here, sign, push.",
+    "Customer connectors pick it up on next update \u2014 no code release.",
+    "",
+    "Schema:",
+    "  id          stable identifier",
+    "  regex       Python re-compatible pattern",
+    "  severity    'crit' | 'warn' | 'info'",
+    "  reason      one-line user-facing explanation",
+    "  scope       'always' | 'piloted' (only enforced when session is piloted)",
+    "  ai          optional list of AI ids; omit for all"
+  ],
+  "patterns": [
+    {
+      "id": "rm-rf-root",
+      "regex": "rm\\s+(-[rRf]+\\s+)+/(?!\\S)",
+      "severity": "crit",
+      "reason": "Recursive delete of the root filesystem.",
+      "scope": "always"
+    },
+    {
+      "id": "rm-rf-home",
+      "regex": "rm\\s+(-[rRf]+\\s+)+~(/|$|\\s)",
+      "severity": "crit",
+      "reason": "Recursive delete of your home directory.",
+      "scope": "always"
+    },
+    {
+      "id": "curl-pipe-bash",
+      "regex": "curl\\s+[^|]*\\|\\s*(bash|sh|zsh|fish)\\b",
+      "severity": "warn",
+      "reason": "Piping a remote script straight into a shell \u2014 verify the source first.",
+      "scope": "always"
+    },
+    {
+      "id": "wget-pipe-bash",
+      "regex": "wget\\s+[^|]*-O-\\s+[^|]*\\|\\s*(bash|sh)\\b",
+      "severity": "warn",
+      "reason": "Piping a remote script into a shell.",
+      "scope": "always"
+    },
+    {
+      "id": "dd-of-disk",
+      "regex": "\\bdd\\b[^\\n]+of=/dev/(sd|nvme|vd|hd)",
+      "severity": "crit",
+      "reason": "Direct write to a block device \u2014 destroys the filesystem.",
+      "scope": "always"
+    },
+    {
+      "id": "mkfs-disk",
+      "regex": "\\bmkfs(\\.\\w+)?\\s+/dev/",
+      "severity": "crit",
+      "reason": "Reformatting a disk partition.",
+      "scope": "always"
+    },
+    {
+      "id": "fork-bomb",
+      "regex": ":\\s*\\(\\)\\s*\\{\\s*:\\|:&\\s*\\}\\s*;:",
+      "severity": "crit",
+      "reason": "Classic fork bomb.",
+      "scope": "always"
+    },
+    {
+      "id": "chmod-777-recursive",
+      "regex": "chmod\\s+(-R\\s+)?7[0-7][0-7]\\s+/",
+      "severity": "warn",
+      "reason": "World-writable on a system path \u2014 opens privilege escalation paths.",
+      "scope": "always"
+    },
+    {
+      "id": "shred-disk",
+      "regex": "shred\\s+[^\\n]+/dev/(sd|nvme|vd)",
+      "severity": "crit",
+      "reason": "Cryptographic disk wipe \u2014 irreversible.",
+      "scope": "always"
+    },
+    {
+      "id": "$comment-piloted-block",
+      "_doc": "Patterns below only enforce when the session is piloted (Pilot Mode). The bar is higher when AI drives AI."
+    },
+    {
+      "id": "sudo-anything",
+      "regex": "(^|\\s|;|&&|\\|\\|)sudo\\s+",
+      "severity": "warn",
+      "reason": "Privilege escalation via sudo \u2014 confirm intent in piloted sessions.",
+      "scope": "piloted"
+    },
+    {
+      "id": "chown-system",
+      "regex": "chown\\s+(-R\\s+)?\\S+\\s+/(etc|usr|var|lib|root)",
+      "severity": "warn",
+      "reason": "Ownership change on a system directory.",
+      "scope": "piloted"
+    },
+    {
+      "id": "setuid",
+      "regex": "chmod\\s+([0-9]*[24-7][0-7][0-7][0-7]|[+]s\\b)",
+      "severity": "warn",
+      "reason": "Setting setuid/setgid bits.",
+      "scope": "piloted"
+    },
+    {
+      "id": "authorized-keys-append",
+      "regex": ">>\\s*[\"']?([~/]|/root|/home/\\S+)\\.ssh/authorized_keys",
+      "severity": "crit",
+      "reason": "Adding an SSH key \u2014 establishing remote access.",
+      "scope": "piloted"
+    },
+    {
+      "id": "crontab-direct",
+      "regex": "(crontab\\s+(-e|-l)|>\\s*/etc/cron|/etc/cron\\.d/)",
+      "severity": "warn",
+      "reason": "Cron edit \u2014 persistence mechanism.",
+      "scope": "piloted"
+    },
+    {
+      "id": "systemd-unit-write",
+      "regex": ">\\s*(/etc|/usr/lib)/systemd/system/[^\\s]+\\.(service|timer|socket)",
+      "severity": "warn",
+      "reason": "Writing a systemd unit \u2014 persistence + privilege.",
+      "scope": "piloted"
+    },
+    {
+      "id": "reverse-shell-nc",
+      "regex": "nc\\s+(-[a-zA-Z]*e\\s+|.*-c\\s+/bin/(ba)?sh)",
+      "severity": "crit",
+      "reason": "Classic netcat reverse shell pattern.",
+      "scope": "always"
+    },
+    {
+      "id": "reverse-shell-bash",
+      "regex": "bash\\s+-i\\s+>&\\s*/dev/tcp/",
+      "severity": "crit",
+      "reason": "Bash reverse shell via /dev/tcp.",
+      "scope": "always"
+    },
+    {
+      "id": "iptables-flush",
+      "regex": "iptables\\s+-F",
+      "severity": "warn",
+      "reason": "Flushing all firewall rules.",
+      "scope": "piloted"
+    },
+    {
+      "id": "ufw-disable",
+      "regex": "ufw\\s+disable",
+      "severity": "warn",
+      "reason": "Disabling the UFW firewall.",
+      "scope": "piloted"
+    },
+    {
+      "id": "history-clear",
+      "regex": "(history\\s+-c|>\\s*~/\\.bash_history|>\\s*\\$HISTFILE)",
+      "severity": "warn",
+      "reason": "Clearing shell history \u2014 anti-forensic.",
+      "scope": "piloted"
+    },
+    {
+      "id": "package-key-add",
+      "regex": "(apt-key\\s+add|gpg\\s+--import|trust-keys)",
+      "severity": "warn",
+      "reason": "Adding a package-signing key \u2014 supply-chain attack vector.",
+      "scope": "piloted"
+    }
+  ]
+}

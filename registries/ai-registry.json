@@ -1,0 +1,285 @@
+{
+  "version": 1,
+  "updated": "2026-04-25",
+  "$comment": [
+    "AITerm AI Registry — single source of truth for AI-CLI metadata.",
+    "Every consumer (connector, pty-manager, dashboard, wizard) reads",
+    "this file. Adding a new AI = appending an entry here, signing,",
+    "pushing. No code changes needed in the four consumers.",
+    "",
+    "Schema:",
+    "  id            stable identifier; lowercase, no spaces",
+    "  label         human-readable name shown in UI",
+    "  icon          single character or emoji for the badge",
+    "  scan          how the connector detects this AI",
+    "  start         how pty-manager spawns it",
+    "  wizard        first-run-wizard HOWTO content (omit to hide)",
+    "  pricing_tag   optional: 'free' | 'paid' | 'byok'"
+  ],
+  "ais": [
+    {
+      "id": "claude",
+      "label": "Claude Code",
+      "icon": "C",
+      "pricing_tag": "paid",
+      "scan": {
+        "binary": "claude",
+        "extra_paths": [
+          "~/.local/bin/claude",
+          "/root/.local/bin/claude",
+          "/usr/local/bin/claude",
+          "/usr/bin/claude"
+        ],
+        "version_arg": "--version",
+        "running_patterns": ["claude --chat", "claude chat", "claude -c"]
+      },
+      "start": { "args": [], "needs_model": false },
+      "wizard": {
+        "tag": "Anthropic — recommended",
+        "blurb": "Best-in-class coding agent. Reads files, runs tests, edits code.",
+        "steps": [
+          { "title": "Install", "code": "curl -fsSL https://claude.ai/install.sh | bash",
+            "note": "From Anthropic. Installs to ~/.local/bin/claude." },
+          { "title": "Sign in", "code": "claude login",
+            "note": "Opens a browser for OAuth." },
+          { "title": "Start coding", "code": "cd /path/to/project && claude" }
+        ],
+        "docs_url": "https://docs.claude.com/claude-code"
+      }
+    },
+    {
+      "id": "ollama",
+      "label": "Ollama",
+      "icon": "O",
+      "pricing_tag": "free",
+      "scan": {
+        "binary": "ollama",
+        "extra_paths": [],
+        "version_arg": "--version",
+        "running_patterns": ["ollama serve", "ollama run"],
+        "list_models_cmd": ["ollama", "list"]
+      },
+      "start": {
+        "args": [],
+        "needs_model": true,
+        "model_arg_template": ["run", "{model}"]
+      },
+      "wizard": {
+        "tag": "Free — runs locally",
+        "blurb": "Local LLMs (Llama 3, Qwen, Mistral). No API key, no cost, full privacy.",
+        "steps": [
+          { "title": "Install", "code": "curl -fsSL https://ollama.com/install.sh | sh" },
+          { "title": "Pull a model", "code": "ollama pull llama3.2",
+            "note": "Other good picks: qwen2.5-coder:7b for coding, mistral-nemo for reasoning." }
+        ],
+        "docs_url": "https://ollama.com/library"
+      }
+    },
+    {
+      "id": "codex",
+      "label": "Codex",
+      "icon": "X",
+      "pricing_tag": "byok",
+      "scan": {
+        "binary": "codex",
+        "extra_paths": [
+          "~/.local/bin/codex",
+          "/usr/local/bin/codex",
+          "/usr/local/lib/node_modules/.bin/codex"
+        ],
+        "version_arg": "--version",
+        "running_patterns": ["codex"]
+      },
+      "start": { "args": [], "needs_model": false },
+      "wizard": {
+        "tag": "OpenAI — needs API key",
+        "blurb": "OpenAI's coding agent CLI. Reads, writes, runs commands.",
+        "steps": [
+          { "title": "Install", "code": "npm install -g @openai/codex",
+            "note": "Requires Node.js 18+." },
+          { "title": "Provide your API key",
+            "code": "export OPENAI_API_KEY=\"sk-...\"",
+            "note": "Get a key at platform.openai.com/api-keys" }
+        ],
+        "docs_url": "https://platform.openai.com/docs"
+      }
+    },
+    {
+      "id": "gemini",
+      "label": "Gemini",
+      "icon": "G",
+      "pricing_tag": "free",
+      "scan": {
+        "binary": "gemini",
+        "extra_paths": [
+          "~/.local/bin/gemini",
+          "/usr/local/bin/gemini",
+          "/usr/local/lib/node_modules/.bin/gemini"
+        ],
+        "version_arg": "--version",
+        "running_patterns": ["gemini"]
+      },
+      "start": { "args": [], "needs_model": false },
+      "wizard": {
+        "tag": "Google — free tier available",
+        "blurb": "Google's coding agent. Free tier with daily limits, no key needed.",
+        "steps": [
+          { "title": "Install", "code": "npm install -g @google/gemini-cli",
+            "note": "Requires Node.js 18+." },
+          { "title": "Sign in (free) or set an API key", "code": "gemini",
+            "note": "First run prompts for Google login (free tier) or set GEMINI_API_KEY from aistudio.google.com." }
+        ],
+        "docs_url": "https://aistudio.google.com/apikey"
+      }
+    },
+    {
+      "id": "aider",
+      "label": "Aider",
+      "icon": "A",
+      "pricing_tag": "byok",
+      "scan": {
+        "binary": "aider",
+        "extra_paths": [
+          "~/.local/bin/aider",
+          "/usr/local/bin/aider",
+          "~/.local/pipx/venvs/aider-chat/bin/aider"
+        ],
+        "version_arg": "--version",
+        "running_patterns": ["aider"]
+      },
+      "start": { "args": [], "needs_model": false },
+      "wizard": {
+        "tag": "Open source — works with any model",
+        "blurb": "AI pair-programmer. Bring your own key (OpenAI / Anthropic / Ollama / others).",
+        "steps": [
+          { "title": "Install", "code": "python -m pip install aider-install && aider-install" },
+          { "title": "Pick a backend",
+            "code": "# Anthropic\nexport ANTHROPIC_API_KEY=\"sk-...\"\naider --model claude-sonnet-4-6\n\n# OpenAI\nexport OPENAI_API_KEY=\"sk-...\"\naider --model gpt-5\n\n# Local Ollama\naider --model ollama/qwen2.5-coder:7b" }
+        ],
+        "docs_url": "https://aider.chat"
+      }
+    },
+    {
+      "id": "goose",
+      "label": "Goose",
+      "icon": "g",
+      "pricing_tag": "byok",
+      "scan": {
+        "binary": "goose",
+        "extra_paths": ["~/.local/bin/goose", "/usr/local/bin/goose"],
+        "version_arg": "--version",
+        "running_patterns": ["goose session", "goose run"]
+      },
+      "start": { "args": ["session"], "needs_model": false }
+    },
+    {
+      "id": "qwen",
+      "label": "Qwen",
+      "icon": "Q",
+      "pricing_tag": "byok",
+      "scan": {
+        "binary": "qwen",
+        "extra_paths": ["~/.local/bin/qwen", "/usr/local/bin/qwen"],
+        "version_arg": "--version",
+        "running_patterns": ["qwen"]
+      },
+      "start": { "args": [], "needs_model": false }
+    },
+    {
+      "id": "llm",
+      "label": "llm",
+      "icon": "l",
+      "pricing_tag": "byok",
+      "scan": {
+        "binary": "llm",
+        "extra_paths": ["~/.local/bin/llm", "/usr/local/bin/llm"],
+        "version_arg": "--version",
+        "running_patterns": ["llm chat", "llm repl"]
+      },
+      "start": { "args": ["chat"], "needs_model": false }
+    },
+    {
+      "id": "sgpt",
+      "label": "ShellGPT",
+      "icon": "s",
+      "pricing_tag": "byok",
+      "scan": {
+        "binary": "sgpt",
+        "extra_paths": ["~/.local/bin/sgpt", "/usr/local/bin/sgpt"],
+        "version_arg": "--version",
+        "running_patterns": ["sgpt --repl", "sgpt --chat"]
+      },
+      "start": { "args": ["--repl", "temp"], "needs_model": false }
+    },
+    {
+      "id": "llamacpp",
+      "label": "llama.cpp",
+      "icon": "L",
+      "pricing_tag": "free",
+      "scan": {
+        "binary": "llama-cli",
+        "alt_binaries": ["llama-server"],
+        "extra_paths": [],
+        "running_patterns": ["llama-server", "llama-cli"]
+      },
+      "start": { "args": [], "needs_model": false }
+    },
+    {
+      "id": "localai",
+      "label": "LocalAI",
+      "icon": "A",
+      "pricing_tag": "free",
+      "scan": {
+        "binary": "local-ai",
+        "extra_paths": [],
+        "running_patterns": ["local-ai"]
+      },
+      "start": { "args": [], "needs_model": false }
+    },
+    {
+      "id": "gpt4all",
+      "label": "GPT4All",
+      "icon": "G",
+      "pricing_tag": "free",
+      "scan": {
+        "binary": "gpt4all",
+        "extra_paths": [],
+        "running_patterns": ["gpt4all"]
+      },
+      "start": { "args": [], "needs_model": false }
+    },
+    {
+      "id": "lmstudio",
+      "label": "LM Studio",
+      "icon": "S",
+      "pricing_tag": "free",
+      "scan": {
+        "binary": null,
+        "port": 1234,
+        "running_patterns": []
+      },
+      "start": null
+    },
+    {
+      "id": "vllm",
+      "label": "vLLM",
+      "icon": "V",
+      "pricing_tag": "free",
+      "scan": {
+        "binary": null,
+        "port": 8000,
+        "running_patterns": ["vllm"]
+      },
+      "start": null
+    },
+    {
+      "id": "bash",
+      "label": "Bash Shell",
+      "icon": "$",
+      "pricing_tag": "free",
+      "hidden_in_wizard": true,
+      "scan": null,
+      "start": { "binary": "bash", "args": [], "needs_model": false }
+    }
+  ]
+}

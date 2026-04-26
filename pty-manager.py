@@ -41,41 +41,58 @@ _ENV_ALLOWED = {
 # ─── Guard Mode: dangerous-command pattern list ──────────────
 # Open source by design — defense relies on human-in-the-loop, not obscurity.
 # Only triggers for bash sessions where the machine has guard_enabled=True.
-_GUARD_PATTERNS = [
-    # Destructive filesystem
-    (re.compile(r"\brm\s+(?:-[a-zA-Z]*r[a-zA-Z]*f|-[a-zA-Z]*f[a-zA-Z]*r|-[rR]\b.*\s-f\b|-f\b.*\s-[rR]\b)"), "recursive forced delete"),
-    (re.compile(r"\brm\s+.*\s/\s*(?:$|;|&)"), "rm targeting root"),
-    (re.compile(r"\bfind\s+.+-delete\b"), "find with -delete"),
-    (re.compile(r"\bdd\s+.*\bof=/dev/(?:sd|nvme|disk|hd|mmcblk|vda|xvd)"), "dd to block device"),
-    (re.compile(r"\bmkfs(?:\.[a-z0-9]+)?\b"), "filesystem format"),
-    (re.compile(r"\bshred\s+-[a-z]*(?:z|u)"), "shred with delete"),
-    # Pipe-to-interpreter (classic curl|bash)
-    (re.compile(r"\b(?:curl|wget|fetch)\s[^;|&]*\|\s*(?:sh|bash|zsh|fish|ksh|python3?|perl|ruby|node)\b"), "pipe remote content to interpreter"),
-    # System-level
-    (re.compile(r"\b(?:shutdown|halt|poweroff|reboot|init\s+0|init\s+6)\b"), "system shutdown/reboot"),
-    (re.compile(r"\b(?:systemctl|service)\s+(?:stop|disable|mask)\b"), "stop or disable service"),
-    # Network / firewall destructive
-    (re.compile(r"\biptables\s+-F\b"), "flush iptables"),
-    (re.compile(r"\bufw\s+disable\b"), "disable ufw firewall"),
-    (re.compile(r"\bnftables\s+flush\b"), "flush nftables"),
-    # Chmod/chown on root or wide wildcards
-    (re.compile(r"\bchmod\s+(?:-R\s+)?(?:777|a\+w)\s+(?:/|/\*|/\s|/$)"), "chmod wide-open at root"),
-    (re.compile(r"\bchown\s+(?:-R\s+)?\S+\s+/(?:$|\s)"), "chown at root"),
-    # Redirect to block device
-    (re.compile(r">\s*/dev/(?:sda|sdb|nvme|mmcblk|xvd|vda|disk\d)"), "write to block device"),
-    # Eval-like
-    (re.compile(r"\beval\s+[\"'`$]"), "eval with dynamic input"),
-    # Fork bomb
-    (re.compile(r":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}"), "fork bomb"),
-    # Overwriting authorized_keys
-    (re.compile(r">\s*~?/?\.ssh/authorized_keys\b"), "overwrite SSH authorized_keys"),
-    (re.compile(r">>\s*~?/?\.ssh/authorized_keys\b"), "append to SSH authorized_keys"),
-]
+# Guard patterns are loaded from guard-patterns.json (single source of truth).
+# Each entry is (compiled_regex, reason, severity, scope). Reload happens at
+# every check call but is cheap because the JSON parse + regex compile are
+# memoised — a future hot-reload signal can clear _GUARD_CACHE.
+_GUARD_CACHE = None
 
 
-def guard_check(line: str):
-    """Return (True, reason) if the command line matches a dangerous pattern, else (False, None)."""
-    for rx, reason in _GUARD_PATTERNS:
+def _hardcoded_guard_fallback():
+    """Used only if guard-patterns.json is missing/malformed. Minimal set."""
+    return [
+        (re.compile(r"\brm\s+(-[rRf]+\s+)+/(?!\S)"), "rm -rf /", "crit", "always"),
+        (re.compile(r"\bcurl\s+[^|]*\|\s*(bash|sh)\b"), "curl|bash", "warn", "always"),
+        (re.compile(r"bash\s+-i\s+>&\s*/dev/tcp/"), "bash reverse shell", "crit", "always"),
+    ]
+
+
+def _load_guard_patterns():
+    global _GUARD_CACHE
+    if _GUARD_CACHE is not None:
+        return _GUARD_CACHE
+    try:
+        import registry_loader  # type: ignore
+        data = registry_loader.load_guard_patterns()
+        out = []
+        for entry in data.get("patterns", []):
+            if not isinstance(entry, dict) or not entry.get("regex"):
+                continue
+            try:
+                rx = re.compile(entry["regex"])
+            except re.error as e:
+                log.warning(f"guard-pattern compile failed for {entry.get('id')}: {e}")
+                continue
+            out.append((rx,
+                        entry.get("reason", entry.get("id", "dangerous pattern")),
+                        entry.get("severity", "warn"),
+                        entry.get("scope", "always")))
+        if not out:
+            out = _hardcoded_guard_fallback()
+        _GUARD_CACHE = out
+    except Exception as e:
+        log.warning(f"guard-patterns load failed, using fallback: {e}")
+        _GUARD_CACHE = _hardcoded_guard_fallback()
+    return _GUARD_CACHE
+
+
+def guard_check(line: str, piloted: bool = False):
+    """Return (True, reason) if the command line matches a dangerous pattern,
+    else (False, None). When `piloted` is True, also enforce 'piloted'-scope
+    patterns — the bar is stricter when AI drives AI."""
+    for rx, reason, sev, scope in _load_guard_patterns():
+        if scope == "piloted" and not piloted:
+            continue
         if rx.search(line):
             return True, reason
     return False, None
@@ -332,28 +349,21 @@ class PtySession:
 sessions = {}  # sid → PtySession
 
 # Known AI binaries and where to find them
-AI_COMMANDS = {
-    "claude": "claude",
-    "ollama": "ollama",
-    "llamacpp": "llama-cli",
-    "localai": "local-ai",
-    "gpt4all": "gpt4all",
-    "bash": "bash",
-    "codex": "codex",
-    "gemini": "gemini",
-    "goose": "goose",
-    "qwen": "qwen",
-    "aider": "aider",
-    "llm": "llm",
-    "sgpt": "sgpt",
-}
+# AI metadata is now sourced from /opt/aiterm/ai-registry.json (signed,
+# distributed via the same Ed25519-manifest pipeline as the connector
+# itself). The legacy AI_COMMANDS / AI_DEFAULT_ARGS / EXTRA_PATHS dicts
+# are derived at startup so existing code paths don't change shape — they
+# just get repopulated whenever the registry is updated. See
+# registry_loader.py for the schema and fallback behaviour.
+try:
+    import registry_loader  # type: ignore
+    AI_COMMANDS = registry_loader.derive_ai_commands()
+    AI_DEFAULT_ARGS = registry_loader.derive_default_args()
+except Exception as _e:
+    log.warning(f"registry_loader unavailable; using hardcoded fallback: {_e}")
+    AI_COMMANDS = {"claude": "claude", "ollama": "ollama", "bash": "bash"}
+    AI_DEFAULT_ARGS = {}
 
-# Default args that switch a CLI into interactive/REPL mode.
-AI_DEFAULT_ARGS = {
-    "goose": ["session"],
-    "llm": ["chat"],
-    "sgpt": ["--repl", "temp"],
-}
 
 def _user_bin_paths(bin_name):
     paths = [
@@ -367,16 +377,28 @@ def _user_bin_paths(bin_name):
         paths.append(f"{npm_prefix}/{bin_name}")
     return paths
 
-EXTRA_PATHS = {
-    "claude": _user_bin_paths("claude"),
-    "codex": _user_bin_paths("codex"),
-    "gemini": _user_bin_paths("gemini"),
-    "goose": _user_bin_paths("goose"),
-    "qwen": _user_bin_paths("qwen"),
-    "aider": _user_bin_paths("aider") + [os.path.expanduser("~/.local/pipx/venvs/aider-chat/bin/aider")],
-    "llm": _user_bin_paths("llm"),
-    "sgpt": _user_bin_paths("sgpt"),
-}
+# Search paths to consult before falling back to PATH lookup. Comes from
+# the registry's `scan.extra_paths` per AI; we additionally seed common
+# user-bin locations so the registry only needs to override unusual cases.
+def _build_extra_paths():
+    out = {}
+    try:
+        registry_extras = registry_loader.derive_extra_paths()
+    except Exception:
+        registry_extras = {}
+    # Default search set — applied to every AI even if the registry doesn't
+    # mention it, so a freshly added AI is immediately findable in user bins.
+    for ai_id, binary in AI_COMMANDS.items():
+        if ai_id == "bash":
+            continue
+        out[ai_id] = _user_bin_paths(binary)
+        # Merge in registry-specific paths, deduping while keeping order.
+        for p in registry_extras.get(ai_id, []):
+            if p not in out[ai_id]:
+                out[ai_id].append(p)
+    return out
+
+EXTRA_PATHS = _build_extra_paths()
 
 
 def _process_context(pid):
@@ -738,6 +760,67 @@ async def handle_client(reader, writer):
         log.info(f"Connector detached ({sum(len(s.clients) for s in sessions.values())} clients remaining)")
 
 
+def _reload_registries():
+    """Hot-reload all registry-derived state without killing sessions.
+    Called on SIGHUP and from the inotify-style mtime poller. Existing
+    PtySession objects keep running — only the lookup tables that decide
+    *what new sessions can do* change."""
+    global AI_COMMANDS, AI_DEFAULT_ARGS, EXTRA_PATHS, _GUARD_CACHE
+    try:
+        import importlib
+        import registry_loader  # type: ignore
+        # Re-import is unnecessary (registry_loader has no module-level cache),
+        # but we do it for symmetry: if the loader file itself changed (e.g.
+        # new helper function), this picks it up.
+        importlib.reload(registry_loader)
+        AI_COMMANDS = registry_loader.derive_ai_commands()
+        AI_DEFAULT_ARGS = registry_loader.derive_default_args()
+        EXTRA_PATHS = _build_extra_paths()
+        _GUARD_CACHE = None  # forces _load_guard_patterns() to re-read JSON
+        log.warning(f"registries reloaded: {len(AI_COMMANDS)} AIs, "
+                    f"{len(_load_guard_patterns())} guard patterns")
+    except Exception as e:
+        log.error(f"registry reload failed: {e}")
+
+
+async def _watch_registries(loop):
+    """Poll registry-file mtimes every 5s. On change, fire the same reload
+    path SIGHUP would. No external dep — stdlib only."""
+    files = [
+        "/opt/aiterm/ai-registry.json",
+        "/opt/aiterm/guard-patterns.json",
+        "/opt/aiterm/doctor-checks.json",
+    ]
+    last = {}
+    # Seed initial state so the first iteration doesn't fire spuriously.
+    for f in files:
+        try:
+            last[f] = os.path.getmtime(f)
+        except FileNotFoundError:
+            last[f] = 0
+    while True:
+        try:
+            await asyncio.sleep(5)
+            changed = []
+            for f in files:
+                try:
+                    m = os.path.getmtime(f)
+                except FileNotFoundError:
+                    m = 0
+                if m and last.get(f) != m:
+                    changed.append(f)
+                    last[f] = m
+            if changed:
+                names = ", ".join(os.path.basename(c) for c in changed)
+                log.info(f"registry mtime changed ({names}) — hot-reload")
+                _reload_registries()
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            log.warning(f"registry watcher error: {e}")
+            await asyncio.sleep(10)
+
+
 async def main():
     # Clean up old socket
     if os.path.exists(SOCKET_PATH):
@@ -750,11 +833,21 @@ async def main():
     loop = asyncio.get_event_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, lambda: stop.set_result(None) if not stop.done() else None)
+    # SIGHUP = hot-reload registries without killing sessions. Used by the
+    # update flow ('aiterm update' sends SIGHUP after a registry-only change)
+    # and available for manual ops: `kill -HUP $(pgrep -f pty-manager)`.
+    loop.add_signal_handler(signal.SIGHUP, _reload_registries)
 
-    log.info(f"PTY Manager ready on {SOCKET_PATH} (multi-session)")
+    # Watcher fires the same reload path automatically when the JSON file
+    # mtime moves, so a manual edit of a registry hot-reloads within ~5 s
+    # even without an explicit signal.
+    watcher_task = asyncio.create_task(_watch_registries(loop))
+
+    log.info(f"PTY Manager ready on {SOCKET_PATH} (multi-session, hot-reload armed)")
     await stop
 
     # Cleanup
+    watcher_task.cancel()
     for sess in sessions.values():
         sess.kill()
     server.close()

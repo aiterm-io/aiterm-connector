@@ -39,8 +39,8 @@ class C:
         OK = WARN = CRIT = DIM = BOLD = END = ""
 
 
-SEVERITY_ICON = {"ok": "✓", "warn": "⚠", "crit": "✗"}
-SEVERITY_COLOR = {"ok": C.OK, "warn": C.WARN, "crit": C.CRIT}
+SEVERITY_ICON = {"ok": "✓", "info": "ℹ", "warn": "⚠", "crit": "✗"}
+SEVERITY_COLOR = {"ok": C.OK, "info": C.DIM, "warn": C.WARN, "crit": C.CRIT}
 
 
 def result(severity, name, summary, why=None, fix=None):
@@ -376,10 +376,58 @@ CHECKS = [
 ]
 
 
+# ── Registry-driven extra checks ──
+# Simple advisories ("is package X installed?") are data-driven so adding
+# a new recommendation is a JSON edit — see doctor-checks.json.
+
+def check_registry_entry(distro, entry):
+    """Run one data-driven check from doctor-checks.json. Returns a result
+    dict in the same shape as the hardcoded checks."""
+    kind = entry.get("kind")
+    target = entry.get("target")
+    name = entry.get("name", entry.get("id", target))
+    severity = entry.get("severity", "info")
+    why = entry.get("why", "")
+    fix_map = entry.get("fix") or {}
+    fix = fix_map.get(distro.get("pkg"), fix_map.get("apt", ""))
+
+    if kind == "binary_exists":
+        if shutil.which(target):
+            return result("ok", name, "available")
+        return result(severity, name, "not installed", why=why, fix=fix)
+    if kind == "service_active":
+        if systemd_active(target):
+            return result("ok", name, f"{target} active")
+        return result(severity, name, f"{target} not active", why=why, fix=fix)
+    if kind == "package_present":
+        # Generic: check if the binary or a typical dpkg/rpm path exists.
+        if shutil.which(target):
+            return result("ok", name, "present")
+        return result(severity, name, "missing", why=why, fix=fix)
+    return None  # unknown kind
+
+
+def load_extra_checks():
+    """Load doctor-checks.json (registry) and yield runnable check tuples."""
+    try:
+        # registry_loader is a sibling file when shipped on a customer machine.
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import registry_loader  # type: ignore
+        data = registry_loader.load_doctor_checks()
+    except Exception:
+        return []
+    out = []
+    for entry in data.get("checks", []):
+        cid = entry.get("id", "registry-check")
+        out.append((cid, lambda d, e=entry: check_registry_entry(d, e)))
+    return out
+
+
 def run_all():
     distro = detect_distro()
     rows = []
-    for cid, fn in CHECKS:
+    all_checks = list(CHECKS) + load_extra_checks()
+    for cid, fn in all_checks:
         try:
             r = fn(distro)
         except Exception as e:

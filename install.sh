@@ -192,10 +192,17 @@ MANIFEST_PUBKEY_HEX = "bc5e9a344e32ec65e490d725f911b8f94c5e8b17812a617da776e8ac8
 api_url, install_dir, bin_dir = sys.argv[1:4]
 
 FILES = [
-    ("connector.py",   f"{install_dir}/connector.py"),
-    ("pty-manager.py", f"{install_dir}/pty-manager.py"),
-    ("doctor.py",      f"{install_dir}/doctor.py"),
-    ("aiterm",         f"{bin_dir}/aiterm"),
+    ("connector.py",         f"{install_dir}/connector.py"),
+    ("pty-manager.py",       f"{install_dir}/pty-manager.py"),
+    ("doctor.py",            f"{install_dir}/doctor.py"),
+    ("registry_loader.py",   f"{install_dir}/registry_loader.py"),
+    ("aiterm",               f"{bin_dir}/aiterm"),
+    # Signed registries — single-source-of-truth metadata for AIs / guard
+    # patterns / extra doctor checks. Adding a new AI is a JSON edit on
+    # the hub; customer connectors pick it up at the next aiterm update.
+    ("ai-registry.json",     f"{install_dir}/ai-registry.json"),
+    ("guard-patterns.json",  f"{install_dir}/guard-patterns.json"),
+    ("doctor-checks.json",   f"{install_dir}/doctor-checks.json"),
 ]
 
 ctx = ssl.create_default_context()
@@ -327,9 +334,21 @@ if [ -f "$INSTALL_DIR/connector.json" ] && [ -f "$INSTALL_DIR/connector.py" ] &&
 
     info "Existing installation found ($INSTALL_DIR)"
 
-    # Hash files before download for conditional-restart logic
+    # Hash files before download for conditional-restart logic.
+    # Three change classes, ordered by impact:
+    #   PTY_CHANGED   pty-manager.py or registry_loader.py changed
+    #                 → full restart, kills active sessions
+    #   CONN_CHANGED  connector.py changed
+    #                 → connector restart, sessions survive (pty-mgr is independent)
+    #   REG_CHANGED   only the JSON registries changed
+    #                 → no restart needed; pty-manager hot-reloads via inotify-mtime
+    #                   poll within 5 s. We send SIGHUP for instant reload.
     PTY_OLD=$(md5sum "$INSTALL_DIR/pty-manager.py" 2>/dev/null | awk '{print $1}')
+    RL_OLD=$(md5sum "$INSTALL_DIR/registry_loader.py" 2>/dev/null | awk '{print $1}')
     CONN_OLD=$(md5sum "$INSTALL_DIR/connector.py" 2>/dev/null | awk '{print $1}')
+    AIREG_OLD=$(md5sum "$INSTALL_DIR/ai-registry.json" 2>/dev/null | awk '{print $1}')
+    GP_OLD=$(md5sum "$INSTALL_DIR/guard-patterns.json" 2>/dev/null | awk '{print $1}')
+    DC_OLD=$(md5sum "$INSTALL_DIR/doctor-checks.json" 2>/dev/null | awk '{print $1}')
 
     ensure_python_deps
     info "Downloading + verifying signed manifest..."
@@ -338,10 +357,19 @@ if [ -f "$INSTALL_DIR/connector.json" ] && [ -f "$INSTALL_DIR/connector.py" ] &&
     [ "$BIN_DIR" != "/usr/local/bin" ] && ensure_path "$BIN_DIR"
 
     PTY_NEW=$(md5sum "$INSTALL_DIR/pty-manager.py" 2>/dev/null | awk '{print $1}')
+    RL_NEW=$(md5sum "$INSTALL_DIR/registry_loader.py" 2>/dev/null | awk '{print $1}')
     CONN_NEW=$(md5sum "$INSTALL_DIR/connector.py" 2>/dev/null | awk '{print $1}')
-    PTY_CHANGED=0; CONN_CHANGED=0
-    [ "$PTY_OLD" != "$PTY_NEW" ] && PTY_CHANGED=1
+    AIREG_NEW=$(md5sum "$INSTALL_DIR/ai-registry.json" 2>/dev/null | awk '{print $1}')
+    GP_NEW=$(md5sum "$INSTALL_DIR/guard-patterns.json" 2>/dev/null | awk '{print $1}')
+    DC_NEW=$(md5sum "$INSTALL_DIR/doctor-checks.json" 2>/dev/null | awk '{print $1}')
+
+    PTY_CHANGED=0; CONN_CHANGED=0; REG_CHANGED=0
+    [ "$PTY_OLD"  != "$PTY_NEW" ]  && PTY_CHANGED=1
+    [ "$RL_OLD"   != "$RL_NEW" ]   && PTY_CHANGED=1   # loader change → reimport unsafe → full restart
     [ "$CONN_OLD" != "$CONN_NEW" ] && CONN_CHANGED=1
+    [ "$AIREG_OLD" != "$AIREG_NEW" ] && REG_CHANGED=1
+    [ "$GP_OLD"    != "$GP_NEW" ]    && REG_CHANGED=1
+    [ "$DC_OLD"    != "$DC_NEW" ]    && REG_CHANGED=1
 
     # Permissions hardening: config must not be world-readable (F-01 fix for old installs)
     if [ -f "$INSTALL_DIR/connector.json" ]; then
@@ -370,16 +398,32 @@ if [ -f "$INSTALL_DIR/connector.json" ] && [ -f "$INSTALL_DIR/connector.py" ] &&
         echo ""
     fi
 
-    # Conditional restart: only what actually changed
+    # Conditional restart: only what actually changed.
+    # PTY restart kills sessions, so we avoid it whenever possible. Pure
+    # registry changes go through SIGHUP — pty-manager re-derives its
+    # lookup tables in-place, sessions stay alive.
     RESTARTED=0
     if $SVC_CMD is-active --quiet aiterm-connector 2>/dev/null; then
         if [ "$PTY_CHANGED" = "1" ]; then
             $SVC_CMD restart aiterm-pty 2>/dev/null && ok "PTY Manager restarted (active sessions reset)"
             RESTARTED=1
+        elif [ "$REG_CHANGED" = "1" ]; then
+            # Registry-only update: explicit SIGHUP for instant pickup; the
+            # mtime poller would catch it within 5 s anyway, but the signal
+            # makes the reload synchronous + visible in the log.
+            pkill -HUP -f "python3.*$INSTALL_DIR/pty-manager.py" 2>/dev/null \
+                && ok "PTY Manager hot-reloaded registries (sessions preserved)" \
+                || ok "Registries updated (will hot-reload within 5 s)"
+            RESTARTED=1
         fi
         if [ "$CONN_CHANGED" = "1" ]; then
             $SVC_CMD restart aiterm-connector 2>/dev/null && ok "Connector restarted"
             RESTARTED=1
+        elif [ "$REG_CHANGED" = "1" ]; then
+            # Connector reads registry fresh on every scan(), so no restart
+            # needed. SIGHUP is a no-op for it today but cheap to send for
+            # future-proofing if connector grows registry caches.
+            pkill -HUP -f "python3.*$INSTALL_DIR/connector.py" 2>/dev/null || true
         fi
         [ "$RESTARTED" = "0" ] && ok "No changes — services untouched"
     else

@@ -1,0 +1,90 @@
+{
+  "version": 1,
+  "updated": "2026-04-25",
+  "$comment": [
+    "Doctor checks registry — partial. Some checks need real Python logic",
+    "(parsing /proc, regex over sshd_config drop-ins). Those stay as code",
+    "in doctor.py. The simpler 'is package X installed?' style checks live",
+    "here as data, so adding a new advisory is a JSON edit.",
+    "",
+    "Each check has cross-distro fix commands keyed by package-manager",
+    "family (apt/dnf/zypper/pacman/apk).",
+    "",
+    "Schema:",
+    "  id              stable identifier",
+    "  name            display name",
+    "  kind            'package_present' | 'service_active' | 'binary_exists'",
+    "  target          package name / unit name / binary name",
+    "  severity        'crit' | 'warn' | 'info' (when missing/inactive)",
+    "  why             one-line reason",
+    "  fix             { apt: '...', dnf: '...', zypper: '...', pacman: '...', apk: '...' }"
+  ],
+  "checks": [
+    {
+      "id": "auditd",
+      "name": "auditd",
+      "kind": "service_active",
+      "target": "auditd",
+      "severity": "info",
+      "why": "auditd records security-relevant kernel events (syscalls, file access). Useful for forensics after an incident.",
+      "fix": {
+        "apt": "sudo apt-get install -y auditd && sudo systemctl enable --now auditd",
+        "dnf": "sudo dnf install -y audit && sudo systemctl enable --now auditd",
+        "zypper": "sudo zypper install -y audit && sudo systemctl enable --now auditd",
+        "pacman": "sudo pacman -S --noconfirm audit && sudo systemctl enable --now auditd",
+        "apk": "sudo apk add audit && sudo rc-update add auditd"
+      }
+    },
+    {
+      "id": "rkhunter",
+      "name": "rkhunter (rootkit scanner)",
+      "kind": "binary_exists",
+      "target": "rkhunter",
+      "severity": "info",
+      "why": "Periodic rootkit scanning catches LD_PRELOAD-style and kernel-module rootkits.",
+      "fix": {
+        "apt": "sudo apt-get install -y rkhunter && sudo rkhunter --update && sudo rkhunter --check",
+        "dnf": "sudo dnf install -y rkhunter && sudo rkhunter --update && sudo rkhunter --check",
+        "zypper": "sudo zypper install -y rkhunter && sudo rkhunter --update && sudo rkhunter --check"
+      }
+    },
+    {
+      "id": "lynis",
+      "name": "lynis (system-hardening audit)",
+      "kind": "binary_exists",
+      "target": "lynis",
+      "severity": "info",
+      "why": "Lynis runs a deeper hardening audit than aiterm doctor — recommended for periodic review.",
+      "fix": {
+        "apt": "sudo apt-get install -y lynis && sudo lynis audit system",
+        "dnf": "sudo dnf install -y lynis && sudo lynis audit system",
+        "zypper": "sudo zypper install -y lynis && sudo lynis audit system",
+        "pacman": "sudo pacman -S --noconfirm lynis && sudo lynis audit system"
+      }
+    },
+    {
+      "id": "needrestart",
+      "name": "needrestart (post-update reboot detection)",
+      "kind": "binary_exists",
+      "target": "needrestart",
+      "severity": "info",
+      "why": "Detects when services use deleted libraries (after a security update) and need restarting.",
+      "fix": {
+        "apt": "sudo apt-get install -y needrestart && sudo needrestart",
+        "dnf": "sudo dnf install -y needrestart"
+      }
+    },
+    {
+      "id": "rsyslog-or-journald",
+      "name": "system logging",
+      "kind": "service_active",
+      "target": "systemd-journald",
+      "severity": "warn",
+      "why": "Without persistent system logs, post-incident forensics is impossible.",
+      "fix": {
+        "apt": "# journald should be active by default — investigate why it's down",
+        "dnf": "# journald should be active by default — investigate why it's down"
+      }
+    }
+  ]
+}

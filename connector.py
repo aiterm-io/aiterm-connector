@@ -195,83 +195,82 @@ def scan():
                 pass
         return False, None
 
-    # Multi-AI detection (minimal checks, details handled server-side)
+    # Multi-AI detection driven by ai-registry.json. Adding a new AI is a
+    # one-line registry edit on the hub — this loop picks it up at next
+    # connector update with no code change.
     ai = {}
-    if info["claude_path"]:
-        running, _ = _proc_running(["claude --chat", "claude chat", "claude -c"])
-        ai["claude"] = {"path": info["claude_path"], "version": info.get("claude_version", ""), "running": running}
-    if shutil.which("ollama"):
-        v = ""
-        try:
-            env = os.environ.copy()
-            env.setdefault("HOME", os.path.expanduser("~"))
-            r = subprocess.run(["ollama", "--version"], capture_output=True, text=True, timeout=5, env=env)
-            v = r.stdout.strip()
-            # Ignore crash output
-            if not v or len(v) > 50 or "panic" in v.lower():
-                v = "installed"
-        except Exception:
-            v = "installed"
-        # Get installed models
-        models = []
-        try:
-            env = os.environ.copy()
-            env.setdefault("HOME", os.path.expanduser("~"))
-            r2 = subprocess.run(["ollama", "list"], capture_output=True, text=True, timeout=10, env=env)
-            for line in r2.stdout.strip().split("\n")[1:]:  # skip header
-                parts = line.split()
-                if parts:
-                    models.append(parts[0])  # model name like "llama3:latest"
-        except Exception:
-            pass
-        running, _ = _proc_running(["ollama serve", "ollama run"])
-        ai["ollama"] = {"version": v, "models": models, "running": running}
-    for tool in ("llama-server", "llama-cli"):
-        p = shutil.which(tool)
-        if p:
-            running, _ = _proc_running(["llama-server", "llama-cli"])
-            ai["llamacpp"] = {"path": p, "running": running}
-            break
-    if shutil.which("local-ai"):
-        running, _ = _proc_running(["local-ai"])
-        ai["localai"] = {"path": shutil.which("local-ai"), "running": running}
-    if shutil.which("gpt4all"):
-        running, _ = _proc_running(["gpt4all"])
-        ai["gpt4all"] = {"path": shutil.which("gpt4all"), "running": running}
+    try:
+        import registry_loader as _rl
+        registry = _rl.load_ai_registry()
+    except Exception as _e:
+        log.warning(f"ai-registry not loaded, using minimal fallback: {_e}")
+        registry = {"ais": [{"id": "claude", "scan": {"binary": "claude",
+                    "extra_paths": ["~/.local/bin/claude", "/root/.local/bin/claude"],
+                    "running_patterns": ["claude"]}}]}
 
-    # New CLI-based backends (codex, gemini, goose, qwen, aider, llm, sgpt).
-    # Same detection pattern: binary present → advertise it. Interactive args
-    # (e.g. "goose session", "llm chat") are applied in pty-manager.
-    SIMPLE_BACKENDS = [
-        ("codex",  ["codex"]),
-        ("gemini", ["gemini"]),
-        ("goose",  ["goose session", "goose run"]),
-        ("qwen",   ["qwen"]),
-        ("aider",  ["aider"]),
-        ("llm",    ["llm chat", "llm repl"]),
-        ("sgpt",   ["sgpt --repl", "sgpt --chat"]),
-    ]
-    for name, running_patterns in SIMPLE_BACKENDS:
-        p = shutil.which(name)
-        # Also check common user-local paths that may not be on PATH under systemd
+    for entry in registry.get("ais", []):
+        scan = entry.get("scan") or {}
+        if not scan or scan.get("binary") is None:
+            continue  # bash, port-only services (lmstudio/vllm) handled elsewhere
+        ai_id = entry["id"]
+        binary = scan["binary"]
+        # Resolve path: PATH first, then registry-listed extras, then common user bins.
+        p = shutil.which(binary)
         if not p:
-            for cand in (f"/root/.local/bin/{name}",
-                         os.path.expanduser(f"~/.local/bin/{name}"),
-                         f"/usr/local/bin/{name}"):
+            candidates = [os.path.expanduser(x) for x in scan.get("extra_paths", [])]
+            candidates += [
+                f"/root/.local/bin/{binary}",
+                os.path.expanduser(f"~/.local/bin/{binary}"),
+                f"/usr/local/bin/{binary}",
+            ]
+            for cand in candidates:
                 if os.path.isfile(cand) and os.access(cand, os.X_OK):
                     p = cand
                     break
-        if p:
-            v = ""
-            try:
-                r = subprocess.run([p, "--version"], capture_output=True, text=True, timeout=5)
-                v = (r.stdout or r.stderr).strip().splitlines()[0] if (r.stdout or r.stderr) else ""
-                if not v or len(v) > 80 or "panic" in v.lower():
-                    v = "installed"
-            except Exception:
+        if not p:
+            continue
+        # Probe version, sanitize crash output.
+        v = ""
+        version_arg = scan.get("version_arg", "--version")
+        try:
+            env = os.environ.copy()
+            env.setdefault("HOME", os.path.expanduser("~"))
+            r = subprocess.run([p, version_arg], capture_output=True,
+                               text=True, timeout=5, env=env)
+            raw = (r.stdout or r.stderr).strip()
+            v = raw.splitlines()[0] if raw else ""
+            if not v or len(v) > 80 or "panic" in v.lower() or "goroutine" in v.lower():
                 v = "installed"
-            running, _ = _proc_running(running_patterns)
-            ai[name] = {"path": p, "version": v, "running": running}
+        except Exception:
+            v = "installed"
+        running_patterns = scan.get("running_patterns", [binary])
+        running, _ = _proc_running(running_patterns)
+        rec = {"path": p, "version": v, "running": running}
+
+        # Ollama-style: enumerate installed models via list_models_cmd.
+        list_cmd = scan.get("list_models_cmd")
+        if list_cmd:
+            models = []
+            try:
+                env = os.environ.copy()
+                env.setdefault("HOME", os.path.expanduser("~"))
+                r2 = subprocess.run(list_cmd, capture_output=True,
+                                    text=True, timeout=10, env=env)
+                for line in r2.stdout.strip().split("\n")[1:]:
+                    parts = line.split()
+                    if parts:
+                        models.append(parts[0])
+            except Exception:
+                pass
+            rec["models"] = models
+
+        ai[ai_id] = rec
+
+    # Backwards-compat: keep the dedicated 'claude_path' info field that the
+    # hub display still reads. Mirror it from the registry-driven scan.
+    if "claude" in ai:
+        info["claude_path"] = ai["claude"]["path"]
+        info["claude_version"] = ai["claude"]["version"]
 
     info["ai"] = ai
 
