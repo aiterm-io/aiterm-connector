@@ -433,7 +433,12 @@ class PtySession:
         msg = json.dumps({"t": "o", "sid": self.sid, "d": base64.b64encode(data).decode()}) + "\n"
         raw = msg.encode()
         dead = set()
-        for w in self.clients:
+        # Snapshot the set: each `await w.drain()` yields control, and a
+        # client connecting or disconnecting in between would mutate
+        # self.clients mid-iteration → RuntimeError("Set changed size
+        # during iteration") and the whole pty-manager crashes. Iterate
+        # over a list copy instead.
+        for w in list(self.clients):
             try:
                 w.write(raw)
                 await w.drain()
@@ -599,7 +604,9 @@ async def handle_client(reader, writer):
     # Send scrollback for all active sessions. Marked with replay=true so the
     # hub REPLACES its scrollback (not appends) and does NOT rebroadcast to
     # already-connected browsers — they already have this content.
-    for sess in sessions.values():
+    # Iterate over list snapshot: each `await writer.drain()` yields, and a
+    # session start/stop in between would mutate the dict mid-iteration.
+    for sess in list(sessions.values()):
         if sess.scrollback:
             try:
                 msg = json.dumps({"t": "o", "sid": sess.sid, "replay": True,
