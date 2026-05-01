@@ -225,9 +225,14 @@ class PtySession:
             self.sock = None
         self.fd = None
 
-    def kill(self):
+    def kill(self, force=False):
         """Tell the supervisor to terminate the AI, then close our socket.
-        Supervisor cleans up the socket file and exits."""
+        Supervisor cleans up the socket file and exits.
+
+        force=True: skip SIGTERM, send SIGKILL via T_KILL_HARD frame,
+        and as belt-and-suspenders also SIGKILL the supervisor PID +
+        unlink the socket file ourselves. Used for stuck Ink-based TUIs
+        that catch SIGTERM and refuse to exit cleanly."""
         # Stop reading from the socket
         if self.fd is not None:
             try:
@@ -238,7 +243,8 @@ class PtySession:
         # and unlinks the socket itself.
         if self.sock is not None:
             try:
-                self.sock.sendall(session_daemon.pack_frame(session_daemon.T_KILL, b""))
+                frame_type = session_daemon.T_KILL_HARD if force else session_daemon.T_KILL
+                self.sock.sendall(session_daemon.pack_frame(frame_type, b""))
             except (OSError, ConnectionError):
                 pass
             try:
@@ -246,9 +252,47 @@ class PtySession:
             except OSError:
                 pass
             self.sock = None
+        if force:
+            # Belt-and-suspenders: directly SIGKILL the AI process AND
+            # the supervisor, then nuke the socket. Covers the case
+            # where the supervisor's own loop is stuck (rare) or the
+            # T_KILL_HARD frame didn't make it through.
+            self._force_external_kill()
         self.fd = None
         self.sock_path = None
         self.pid = None
+
+    def _force_external_kill(self):
+        """SIGKILL the AI (self.pid) and the supervisor (looked up via
+        sock_path's .meta file), then unlink the supervisor socket so a
+        re-spawn in the same session id doesn't trip on stale state."""
+        try:
+            if self.pid:
+                os.kill(self.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        # Read supervisor PID from the .meta sidecar (session_daemon
+        # writes it there on spawn). Best-effort.
+        sup_pid = None
+        try:
+            if self.sock_path:
+                meta = json.loads(open(self.sock_path + ".meta").read())
+                sup_pid = int(meta.get("supervisor_pid") or 0) or None
+        except Exception:
+            pass
+        if sup_pid:
+            try:
+                os.kill(sup_pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        # Remove socket + meta so cleanup_dead_sessions doesn't get
+        # confused on the next pty-manager startup.
+        for suffix in ("", ".meta"):
+            try:
+                if self.sock_path:
+                    os.unlink(self.sock_path + suffix)
+            except OSError:
+                pass
 
     def resize(self, rows, cols):
         if self.sock is None:
@@ -804,10 +848,11 @@ async def handle_client(reader, writer):
                 log.info(f"Session {sid} started: {ai_type} in {cwd}")
 
             elif t == "stop":
+                force = bool(msg.get("force", False))
                 sess = sessions.pop(sid, None)
                 if sess:
-                    sess.kill()
-                    log.info(f"Session {sid} stopped")
+                    sess.kill(force=force)
+                    log.info(f"Session {sid} stopped" + (" (forced)" if force else ""))
                 resp = {"t": "stopped", "sid": sid}
                 writer.write((json.dumps(resp) + "\n").encode())
                 await writer.drain()

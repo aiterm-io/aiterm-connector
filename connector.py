@@ -739,7 +739,10 @@ async def push_to_hub(config):
                             pty_writer.write((json.dumps({"t": "start", "sid": sid, "ai": msg.get("ai", ""), "cwd": msg.get("cwd", ""), "guard": bool(msg.get("guard", False))}) + "\n").encode())
                             await pty_writer.drain()
                         elif t == "stop_ai" and pty_writer:
-                            pty_writer.write((json.dumps({"t": "stop", "sid": sid}) + "\n").encode())
+                            pty_writer.write((json.dumps({
+                                "t": "stop", "sid": sid,
+                                "force": bool(msg.get("force", False)),
+                            }) + "\n").encode())
                             await pty_writer.drain()
                         elif t == "kill_all" and pty_writer:
                             log.warning("KILL_ALL received from hub — propagating to PTY manager")

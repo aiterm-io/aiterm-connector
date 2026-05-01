@@ -48,7 +48,8 @@ T_DATA = 0x01
 T_RESIZE = 0x02
 T_META_REQ = 0x03
 T_META_RESP = 0x04
-T_KILL = 0x05
+T_KILL = 0x05         # SIGTERM — gives the AI a chance to clean up
+T_KILL_HARD = 0x06    # SIGKILL — for stuck TUIs that ignore SIGTERM
 
 
 def _ensure_sock_dir():
@@ -240,6 +241,14 @@ def _supervisor_main(sid, cmd, cwd, env, master_fd, slave_fd, ai_pid, sock_path)
             except (ProcessLookupError, PermissionError):
                 pass
             # Loop will exit via waitpid below.
+        elif ftype == T_KILL_HARD:
+            # Stuck-TUI bypass: skip SIGTERM and go straight to SIGKILL.
+            # Used by the dashboard's "Force close" path when normal
+            # stop_ai didn't drop the session within the timeout.
+            try:
+                os.kill(ai_pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
 
     while True:
         # Reap AI process if it exited.
