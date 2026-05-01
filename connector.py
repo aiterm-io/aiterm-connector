@@ -537,53 +537,6 @@ async def watch_honeytokens(send_fn, paths, poll_seconds=60):
 # ─── PTY Manager Relay ────────────────────────────────────────
 PTY_SOCKET = str(Path(BASE_DIR) / "pty.sock")
 
-async def pty_relay(ws, config):
-    """Relay between hub WebSocket and local PTY manager Unix socket."""
-    reader = writer = None
-    try:
-        reader, writer = await asyncio.open_unix_connection(PTY_SOCKET)
-        log.info("Connected to PTY manager")
-    except Exception as e:
-        log.error(f"PTY manager not reachable: {e}")
-        return
-
-    # Read initial session list from PTY manager
-    try:
-        line = await asyncio.wait_for(reader.readline(), timeout=5)
-        msg = json.loads(line)
-        if msg.get("t") == "sessions":
-            # Re-announce existing sessions to hub
-            for sess in msg.get("sessions", []):
-                await ws.send(json.dumps({"t": "started", "sid": sess["sid"], "ai": "claude",
-                    "name": "Claude Code", "cwd": sess.get("cwd", "")}))
-    except Exception:
-        pass
-
-    # Forward PTY manager output → hub
-    async def pty_to_hub():
-        try:
-            while True:
-                line = await reader.readline()
-                if not line:
-                    break
-                msg = json.loads(line)
-                await ws.send(json.dumps(msg))
-        except (asyncio.CancelledError, ConnectionResetError):
-            pass
-
-    relay_task = asyncio.create_task(pty_to_hub())
-
-    try:
-        yield writer  # give caller the writer for sending commands
-    finally:
-        relay_task.cancel()
-        if writer:
-            try:
-                writer.close()
-            except Exception:
-                pass
-
-
 def _spki_hash_from_der(cert_der):
     """Return sha256(SubjectPublicKeyInfo) hex for the given DER cert.
     Used to pin the server's public key, not the whole cert — the SPKI
@@ -758,7 +711,8 @@ async def push_to_hub(config):
                             if not line:
                                 break
                             await sock.send(line.decode().rstrip("\n"))
-                    except (asyncio.CancelledError, ConnectionResetError):
+                    except (asyncio.CancelledError, ConnectionResetError,
+                            websockets.ConnectionClosed):
                         pass
 
                 relay_task = asyncio.create_task(pty_to_hub(pty_reader, ws))
@@ -1111,8 +1065,15 @@ def self_update():
             if new_data == old_data:
                 print(f"  \033[2m· {fname}: already up to date\033[0m")
             else:
-                target.write_bytes(new_data)
-                target.chmod(0o755)
+                # Atomic replace: write to .new, fsync, rename. Without
+                # this, SIGKILL or power-loss mid-write leaves a half-
+                # written connector.py that systemd cannot restart.
+                tmp = target.with_suffix(target.suffix + ".new")
+                tmp.write_bytes(new_data)
+                with open(tmp, "rb") as _f:
+                    os.fsync(_f.fileno())
+                tmp.chmod(0o755)
+                os.replace(tmp, target)
                 print(f"  \033[0;32m✓\033[0m {fname}: updated ({len(new_data)} bytes, hash verified)")
         except Exception as e:
             print(f"  \033[0;31m✗\033[0m {fname}: {e}")

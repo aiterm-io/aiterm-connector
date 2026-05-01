@@ -126,6 +126,7 @@ class PtySession:
         self.cmd_args = cmd_args or []
         self.cwd = cwd
         self.pid = None              # AI process PID (reported by daemon)
+        self.sup_pid = None          # supervisor PID, captured at spawn/reattach
         self.fd = None               # socket FD to the supervisor
         self.sock = None             # the socket itself (kept for sendall)
         self.sock_path = None        # /run/aiterm/sess_<sid>.sock
@@ -186,6 +187,11 @@ class PtySession:
             log.error(f"session_daemon.spawn failed: {e}")
             raise
         self.pid = ai_pid
+        # Read supervisor_pid ONCE from .meta and stash. We never re-read
+        # it from disk — _force_external_kill must not target an
+        # attacker-controlled PID later. Best-effort: the meta file is
+        # written by session_daemon synchronously inside spawn().
+        self.sup_pid = self._read_sup_pid_from_meta(sock_path)
         self.scrollback.clear()
         self._sock_rbuf.clear()
         self._attach_socket(sock_path)
@@ -202,11 +208,23 @@ class PtySession:
             self.cmd_args = cmd_field[1:]
         self.cwd = meta.get("cwd") or self.cwd
         self.pid = meta.get("ai_pid")
+        try:
+            self.sup_pid = int(meta.get("supervisor_pid") or 0) or None
+        except (TypeError, ValueError):
+            self.sup_pid = None
         self.started_at = meta.get("started_at")
         self.scrollback.clear()
         self._sock_rbuf.clear()
         self._attach_socket(sock_path)
         log.info(f"Session {self.sid}: reattached to existing supervisor (ai_pid {self.pid})")
+
+    @staticmethod
+    def _read_sup_pid_from_meta(sock_path):
+        try:
+            meta = json.loads(open(sock_path + ".meta").read())
+            return int(meta.get("supervisor_pid") or 0) or None
+        except Exception:
+            return None
 
     def detach(self):
         """Close our socket to the supervisor without killing the AI.
@@ -263,26 +281,23 @@ class PtySession:
         self.pid = None
 
     def _force_external_kill(self):
-        """SIGKILL the AI (self.pid) and the supervisor (looked up via
-        sock_path's .meta file), then unlink the supervisor socket so a
-        re-spawn in the same session id doesn't trip on stale state."""
+        """SIGKILL the AI (self.pid) and the supervisor (self.sup_pid,
+        captured at spawn/reattach time and never re-read from disk),
+        then unlink the supervisor socket so a re-spawn in the same
+        session id doesn't trip on stale state.
+
+        Reading supervisor_pid from .meta at kill-time would let any
+        attacker who can write the .meta file force pty-manager to
+        SIGKILL arbitrary PIDs. We capture once at spawn time so post-
+        spawn .meta tampering can't redirect the kill."""
         try:
             if self.pid:
                 os.kill(self.pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError, OSError):
             pass
-        # Read supervisor PID from the .meta sidecar (session_daemon
-        # writes it there on spawn). Best-effort.
-        sup_pid = None
-        try:
-            if self.sock_path:
-                meta = json.loads(open(self.sock_path + ".meta").read())
-                sup_pid = int(meta.get("supervisor_pid") or 0) or None
-        except Exception:
-            pass
-        if sup_pid:
+        if self.sup_pid:
             try:
-                os.kill(sup_pid, signal.SIGKILL)
+                os.kill(self.sup_pid, signal.SIGKILL)
             except (ProcessLookupError, PermissionError, OSError):
                 pass
         # Remove socket + meta so cleanup_dead_sessions doesn't get
