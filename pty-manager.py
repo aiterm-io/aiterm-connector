@@ -667,6 +667,29 @@ async def handle_client(reader, writer):
             except Exception:
                 pass
 
+    # Replay any active external_collision state so a fresh connector
+    # learns about strangers that were detected before it attached.
+    # Without this, the dedup table hides them until the ext_pid changes.
+    for sid, ext_pid in list(_last_collision_state.items()):
+        sess = sessions.get(sid)
+        if not sess:
+            continue
+        bin_name = os.path.basename(sess.cmd or "")
+        cmdline = ""
+        try:
+            with open(f"/proc/{ext_pid}/cmdline", "rb") as f:
+                cmdline = f.read().decode("utf-8", "replace").replace("\x00", " ").strip()[:120]
+        except Exception:
+            pass
+        try:
+            msg = json.dumps({"t": "external_collision", "sid": sid,
+                              "cwd": sess.cwd, "ext_pid": ext_pid,
+                              "cmdline": cmdline, "ai": bin_name}) + "\n"
+            writer.write(msg.encode())
+            await writer.drain()
+        except Exception:
+            pass
+
     try:
         while True:
             line = await reader.readline()
@@ -940,6 +963,33 @@ async def _broadcast_to_connectors(msg_dict):
     _connector_writers.difference_update(dead)
 
 
+def _find_all_processes_in_cwd(binary_name, target_cwd):
+    """Like find_running_process(), but returns ALL matching PIDs instead
+    of stopping at the first one. The collision watcher needs the full
+    set so it can exclude its own session's ai_pid and still surface
+    truly external instances."""
+    EXCLUDE_PATTERNS = ["serve", "server", "daemon", "-d", "--daemon"]
+    target = os.path.realpath(target_cwd)
+    my_pid = os.getpid()
+    found = []
+    try:
+        for pid_dir in os.listdir("/proc"):
+            if not pid_dir.isdigit() or int(pid_dir) == my_pid:
+                continue
+            try:
+                proc_cwd = os.path.realpath(f"/proc/{pid_dir}/cwd")
+                if proc_cwd != target:
+                    continue
+                cmdline = open(f"/proc/{pid_dir}/cmdline", "rb").read().decode(errors="replace")
+                if binary_name in cmdline and not any(pat in cmdline for pat in EXCLUDE_PATTERNS):
+                    found.append(int(pid_dir))
+            except (PermissionError, FileNotFoundError, ProcessLookupError):
+                continue
+    except Exception:
+        pass
+    return found
+
+
 async def _watch_external_collisions():
     """Every 30 s, look for external Claude/AI processes running in the
     SAME cwd as one of our supervised sessions. Emit external_collision
@@ -962,10 +1012,12 @@ async def _watch_external_collisions():
                 bin_name = os.path.basename(cmd)
                 if bin_name in ("ollama",):  # daemon-like, skip
                     continue
-                ext = find_running_process(bin_name, cwd)
-                # Reject our own ai_pid (the supervisor's child).
-                if ext == sess.pid:
-                    ext = None
+                # Find every same-binary process in this cwd, then
+                # subtract the session's own ai_pid. Anything left is
+                # a stranger we should warn about.
+                candidates = _find_all_processes_in_cwd(bin_name, cwd)
+                ext_pids = [p for p in candidates if p != sess.pid]
+                ext = ext_pids[0] if ext_pids else None
                 last = _last_collision_state.get(sid)
                 if ext and ext != last:
                     _last_collision_state[sid] = ext
