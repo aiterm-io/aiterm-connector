@@ -584,6 +584,24 @@ async def pty_relay(ws, config):
                 pass
 
 
+def _spki_hash_from_der(cert_der):
+    """Return sha256(SubjectPublicKeyInfo) hex for the given DER cert.
+    Used to pin the server's public key, not the whole cert — the SPKI
+    survives Let's Encrypt's regular cert renewals as long as the key
+    isn't rotated."""
+    import hashlib as _hl
+    from cryptography import x509
+    from cryptography.hazmat.primitives.serialization import (
+        Encoding, PublicFormat,
+    )
+    cert = x509.load_der_x509_certificate(cert_der)
+    spki_der = cert.public_key().public_bytes(
+        encoding=Encoding.DER,
+        format=PublicFormat.SubjectPublicKeyInfo,
+    )
+    return _hl.sha256(spki_der).hexdigest()
+
+
 async def push_to_hub(config):
     """Connect to hub, relay to PTY manager. Connector is thin.
 
@@ -614,25 +632,53 @@ async def push_to_hub(config):
                 ping_interval=30, ping_timeout=10,
                 open_timeout=10, ssl=ssl_ctx,
             ) as ws:
-                # Certificate pinning (TOFU: Trust On First Use)
+                # Certificate pinning (TOFU: Trust On First Use).
+                #
+                # Pin on Subject Public Key Info (SPKI), not full DER. The
+                # SPKI hash survives Let's Encrypt's 60-90 day rotations as
+                # long as the key isn't rotated — DER pinning would lock
+                # every customer out at the next renewal.
+                #
+                # On confirmed mismatch we EXIT with a non-zero status so
+                # systemd surfaces the failure instead of looping silently.
+                # Legacy DER pins (from connector versions < 2026.05.01) are
+                # auto-migrated on first successful match.
                 if ssl_ctx and hasattr(ws, 'transport'):
                     try:
                         cert_der = ws.transport.get_extra_info('ssl_object').getpeercert(binary_form=True)
                         if cert_der:
-                            cert_hash = _hl.sha256(cert_der).hexdigest()
+                            spki_hash = _spki_hash_from_der(cert_der)
+                            der_hash = _hl.sha256(cert_der).hexdigest()
                             pin_file = BASE_DIR / ".cert_pin"
                             if pin_file.exists():
-                                saved_hash = pin_file.read_text().strip()
-                                if saved_hash and saved_hash != cert_hash:
-                                    log.error(f"CERTIFICATE CHANGED! Expected {saved_hash[:16]}... got {cert_hash[:16]}...")
-                                    log.error("Possible MITM attack. Delete .cert_pin to accept new cert.")
-                                    await ws.close()
-                                    await asyncio.sleep(60)
-                                    continue
+                                raw = pin_file.read_text().strip()
+                                if raw.startswith("spki:"):
+                                    expected = raw[5:]
+                                    if spki_hash != expected:
+                                        log.error(f"CERTIFICATE KEY ROTATED OR MITM. Expected SPKI {expected[:16]}... got {spki_hash[:16]}...")
+                                        log.error("To trust the new cert: rm .cert_pin && systemctl restart aiterm-connector")
+                                        await ws.close()
+                                        sys.exit(2)
+                                else:
+                                    # Legacy DER-format pin — match against full DER once,
+                                    # then upgrade to SPKI. Any mismatch here can't be
+                                    # distinguished from a benign LE rotation, so we
+                                    # exit and leave it to the operator to re-pin.
+                                    if raw == der_hash:
+                                        pin_file.write_text(f"spki:{spki_hash}")
+                                        os.chmod(str(pin_file), 0o600)
+                                        log.info(f"Migrated cert pin DER→SPKI: {spki_hash[:16]}...")
+                                    else:
+                                        log.error(f"Legacy cert pin mismatch (DER). Got {der_hash[:16]}..., expected {raw[:16]}...")
+                                        log.error("Cannot distinguish LE rotation from MITM with legacy pin. To re-trust: rm .cert_pin && systemctl restart aiterm-connector")
+                                        await ws.close()
+                                        sys.exit(2)
                             else:
-                                pin_file.write_text(cert_hash)
+                                pin_file.write_text(f"spki:{spki_hash}")
                                 os.chmod(str(pin_file), 0o600)
-                                log.info(f"Certificate pinned: {cert_hash[:16]}...")
+                                log.info(f"Certificate pinned (SPKI): {spki_hash[:16]}...")
+                    except SystemExit:
+                        raise
                     except Exception as e:
                         log.warning(f"Certificate pinning check failed: {e}")
                 # Auth
