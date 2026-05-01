@@ -497,6 +497,9 @@ class PtySession:
 
 # ── Session Manager ──────────────────────────────────────────
 sessions = {}  # sid → PtySession
+_connector_writers = set()      # all connectors currently attached
+_last_collision_state = {}      # sid → ext_pid (last reported) — used to
+                                # dedupe and emit "cleared" when it goes away
 
 # Known AI binaries and where to find them
 # AI metadata is now sourced from /opt/aiterm/ai-registry.json (signed,
@@ -632,6 +635,10 @@ def find_binary(ai_type):
 async def handle_client(reader, writer):
     """Handle a connector connection."""
     log.info("Connector attached")
+
+    # Track this writer in the global set so non-session-specific
+    # broadcasts (external_collision, etc.) can reach every connector.
+    _connector_writers.add(writer)
 
     # Register this writer with all existing sessions (for output broadcast)
     for sess in sessions.values():
@@ -908,6 +915,7 @@ async def handle_client(reader, writer):
     except (asyncio.IncompleteReadError, ConnectionResetError, BrokenPipeError):
         pass
     finally:
+        _connector_writers.discard(writer)
         # Remove this writer from all sessions (but keep sessions alive!)
         for sess in sessions.values():
             sess.clients.discard(writer)
@@ -916,6 +924,74 @@ async def handle_client(reader, writer):
         except Exception:
             pass
         log.info(f"Connector detached ({sum(len(s.clients) for s in sessions.values())} clients remaining)")
+
+
+async def _broadcast_to_connectors(msg_dict):
+    """Send a JSON line to every attached connector. Used for non-
+    session-specific events (e.g. external-process collision warnings)."""
+    line = (json.dumps(msg_dict) + "\n").encode()
+    dead = set()
+    for w in list(_connector_writers):
+        try:
+            w.write(line)
+            await w.drain()
+        except Exception:
+            dead.add(w)
+    _connector_writers.difference_update(dead)
+
+
+async def _watch_external_collisions():
+    """Every 30 s, look for external Claude/AI processes running in the
+    SAME cwd as one of our supervised sessions. Emit external_collision
+    when found, external_collision_cleared when previously-seen ones
+    disappear. The dashboard renders an inline warning so the user
+    knows two instances might be touching the same files (CLAUDE.md,
+    .claude/settings.json, git state, …).
+
+    Direction covered here is the inverse of process_conflict: that
+    one fires when *we* try to spawn into an occupied dir. This one
+    fires when somebody opens a second AI from outside (SSH, PuTTY)
+    while a dashboard session is already running."""
+    while True:
+        try:
+            for sid, sess in list(sessions.items()):
+                cwd = (sess.cwd or "").strip()
+                cmd = (sess.cmd or "").strip()
+                if not cwd or not cmd or not os.path.isdir(cwd):
+                    continue
+                bin_name = os.path.basename(cmd)
+                if bin_name in ("ollama",):  # daemon-like, skip
+                    continue
+                ext = find_running_process(bin_name, cwd)
+                # Reject our own ai_pid (the supervisor's child).
+                if ext == sess.pid:
+                    ext = None
+                last = _last_collision_state.get(sid)
+                if ext and ext != last:
+                    _last_collision_state[sid] = ext
+                    cmdline = ""
+                    try:
+                        with open(f"/proc/{ext}/cmdline", "rb") as f:
+                            cmdline = f.read().decode("utf-8", "replace").replace("\x00", " ").strip()[:120]
+                    except Exception:
+                        pass
+                    await _broadcast_to_connectors({
+                        "t": "external_collision",
+                        "sid": sid, "cwd": cwd, "ext_pid": ext,
+                        "cmdline": cmdline, "ai": bin_name,
+                    })
+                    log.info(f"external collision: sid={sid} cwd={cwd} ext_pid={ext}")
+                elif not ext and last:
+                    _last_collision_state.pop(sid, None)
+                    await _broadcast_to_connectors({
+                        "t": "external_collision_cleared", "sid": sid,
+                    })
+            # Drop entries for sessions that no longer exist.
+            for stale_sid in [s for s in _last_collision_state if s not in sessions]:
+                _last_collision_state.pop(stale_sid, None)
+        except Exception as e:
+            log.warning(f"external_collision watcher error: {e}")
+        await asyncio.sleep(30)
 
 
 def _reload_registries():
@@ -1043,6 +1119,7 @@ async def main():
     # mtime moves, so a manual edit of a registry hot-reloads within ~5 s
     # even without an explicit signal.
     watcher_task = asyncio.create_task(_watch_registries(loop))
+    collision_task = asyncio.create_task(_watch_external_collisions())
 
     # Reattach supervisor processes from a previous pty-manager run. Their
     # AI children kept running while we were down; we just plug back in.
@@ -1057,6 +1134,7 @@ async def main():
     # The supervisor processes keep running with the AI children attached;
     # the next pty-manager instance will reattach. Survives its own updates.
     watcher_task.cancel()
+    collision_task.cancel()
     for sess in sessions.values():
         sess.detach()
     server.close()
