@@ -744,6 +744,33 @@ async def push_to_hub(config):
                                 "force": bool(msg.get("force", False)),
                             }) + "\n").encode())
                             await pty_writer.drain()
+                        elif t == "run_doctor":
+                            # Spawn doctor.py --json locally, ship JSON
+                            # back to the dashboard. Read-only check, no
+                            # privilege escalation. Capped runtime so a
+                            # broken subprocess can't stall the connector.
+                            try:
+                                proc = await asyncio.create_subprocess_exec(
+                                    sys.executable, str(BASE_DIR / "doctor.py"), "--json",
+                                    stdout=asyncio.subprocess.PIPE,
+                                    stderr=asyncio.subprocess.PIPE)
+                                try:
+                                    out, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+                                except asyncio.TimeoutError:
+                                    proc.kill()
+                                    out = b'{"error":"doctor.py timed out after 30s"}'
+                                try:
+                                    parsed = json.loads(out.decode("utf-8", "replace"))
+                                except Exception as e:
+                                    parsed = {"error": f"doctor.py output unparseable: {e}"}
+                                await ws.send(json.dumps({
+                                    "t": "doctor_result", "report": parsed,
+                                }))
+                            except Exception as e:
+                                await ws.send(json.dumps({
+                                    "t": "doctor_result",
+                                    "report": {"error": f"doctor.py spawn failed: {e}"},
+                                }))
                         elif t == "kill_all" and pty_writer:
                             log.warning("KILL_ALL received from hub — propagating to PTY manager")
                             pty_writer.write((json.dumps({"t": "kill_all"}) + "\n").encode())
