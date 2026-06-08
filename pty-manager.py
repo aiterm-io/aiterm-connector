@@ -1079,8 +1079,10 @@ async def _watch_external_collisions():
                 # Sprint F Fix 3.
                 own_pids = set()
                 for s in sessions.values():
-                    if s.pid:     own_pids.add(s.pid)
-                    if s.sup_pid: own_pids.add(s.sup_pid)
+                    if s.pid:
+                        own_pids.add(s.pid)
+                    if s.sup_pid:
+                        own_pids.add(s.sup_pid)
                 candidates = _find_all_processes_in_cwd(bin_name, cwd)
                 ext_pids = [p for p in candidates if p not in own_pids]
                 ext = ext_pids[0] if ext_pids else None
