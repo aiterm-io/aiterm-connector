@@ -1005,6 +1005,49 @@ def _find_all_processes_in_cwd(binary_name, target_cwd):
     return found
 
 
+async def _reap_dead_sessions():
+    """Sprint F fix 2: periodic safety-net for sessions whose AI process
+    is gone but nobody told us. Mostly catches:
+      - AI got SIGKILL'd from outside (oom-killer, panic-button, manual)
+      - supervisor socket dropped via _handle_supervisor_gone but the
+        original "stop"-msg never reached pty-manager (Hub crashed mid-flow,
+        race during Mobile-disconnect, …)
+    Without reaping, Hub list_sessions reports zombie sessions as alive
+    and the Frontend renders a frozen pane.
+    Runs every 10 s. is_alive() probes via os.kill(pid, 0)."""
+    while True:
+        try:
+            await asyncio.sleep(10)
+            now_dead = []
+            for sid, sess in list(sessions.items()):
+                if not sess.is_alive():
+                    now_dead.append(sid)
+            for sid in now_dead:
+                sess = sessions.pop(sid, None)
+                if sess is None:
+                    continue
+                _last_collision_state.pop(sid, None)
+                # Tell connectors so the Hub clears its own ai_sessions
+                # entry and the Frontend can re-render the tab as stopped.
+                try:
+                    await _broadcast_to_connectors({"t": "stopped", "sid": sid})
+                except Exception as e:
+                    log.warning(f"reaper broadcast stopped {sid} failed: {e}")
+                # Best-effort: release the supervisor socket FD if it
+                # somehow survived (normally _handle_supervisor_gone
+                # already nulled it; detach() is idempotent).
+                try:
+                    sess.detach()
+                except Exception:
+                    pass
+                log.info(f"reaper: pruned dead session sid={sid}")
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            log.warning(f"reaper error: {e}")
+            await asyncio.sleep(10)
+
+
 async def _watch_external_collisions():
     """Every 30 s, look for external Claude/AI processes running in the
     SAME cwd as one of our supervised sessions. Emit external_collision
@@ -1027,11 +1070,19 @@ async def _watch_external_collisions():
                 bin_name = os.path.basename(cmd)
                 if bin_name in ("ollama",):  # daemon-like, skip
                     continue
-                # Find every same-binary process in this cwd, then
-                # subtract the session's own ai_pid. Anything left is
-                # a stranger we should warn about.
+                # Find every same-binary process in this cwd, then subtract
+                # ALL of our own supervised PIDs (every running session's
+                # ai_pid AND its supervisor_pid). Without the union check,
+                # a legitimate second session of the same AI in the same
+                # directory triggers a false "external Claude detected"
+                # warning — exactly the bug Manuel hit on Mobile-Logout.
+                # Sprint F Fix 3.
+                own_pids = set()
+                for s in sessions.values():
+                    if s.pid:     own_pids.add(s.pid)
+                    if s.sup_pid: own_pids.add(s.sup_pid)
                 candidates = _find_all_processes_in_cwd(bin_name, cwd)
-                ext_pids = [p for p in candidates if p != sess.pid]
+                ext_pids = [p for p in candidates if p not in own_pids]
                 ext = ext_pids[0] if ext_pids else None
                 last = _last_collision_state.get(sid)
                 if ext and ext != last:
@@ -1187,6 +1238,7 @@ async def main():
     # even without an explicit signal.
     watcher_task = asyncio.create_task(_watch_registries(loop))
     collision_task = asyncio.create_task(_watch_external_collisions())
+    reaper_task = asyncio.create_task(_reap_dead_sessions())
 
     # Reattach supervisor processes from a previous pty-manager run. Their
     # AI children kept running while we were down; we just plug back in.
@@ -1197,17 +1249,53 @@ async def main():
         log.info(f"PTY Manager ready on {SOCKET_PATH} (multi-session, hot-reload armed)")
     await stop
 
-    # Graceful shutdown: DETACH all sessions instead of killing them.
-    # The supervisor processes keep running with the AI children attached;
-    # the next pty-manager instance will reattach. Survives its own updates.
+    # Sprint F.1 fix B: graceful shutdown of AI children before tearing
+    # down the manager. Without this, claude children outlive pty-manager
+    # but their auth-token-refresh path gets killed once systemd's CGroup
+    # cleanup hits — Manuel had to /login on every service restart.
+    # New flow: SIGTERM every ai_pid, give them up to 3s total to flush
+    # state, then SIGKILL stragglers, THEN do the existing detach +
+    # server.close. Sessions don't survive the restart anymore (the
+    # detach-survives-update feature is sacrificed for token persistence).
     watcher_task.cancel()
     collision_task.cancel()
+    reaper_task.cancel()
+    term_targets = [s for s in sessions.values() if s.pid]
+    for sess in term_targets:
+        try:
+            os.kill(sess.pid, signal.SIGTERM)
+            log.info(f"shutdown: SIGTERM → sid={sess.sid} pid={sess.pid}")
+        except ProcessLookupError:
+            pass
+        except Exception as e:
+            log.warning(f"shutdown SIGTERM sid={sess.sid} failed: {e}")
+    # Total budget across all sessions, polled every 100 ms.
+    SHUTDOWN_BUDGET_S = 3.0
+    deadline = asyncio.get_event_loop().time() + SHUTDOWN_BUDGET_S
+    while asyncio.get_event_loop().time() < deadline:
+        if not any(s.is_alive() for s in term_targets):
+            break
+        await asyncio.sleep(0.1)
+    # Anyone still alive gets the hammer.
+    for sess in term_targets:
+        if sess.is_alive():
+            try:
+                os.kill(sess.pid, signal.SIGKILL)
+                log.warning(f"shutdown: SIGKILL → sid={sess.sid} pid={sess.pid} (didn't exit in {SHUTDOWN_BUDGET_S}s)")
+            except ProcessLookupError:
+                pass
+            except Exception as e:
+                log.warning(f"shutdown SIGKILL sid={sess.sid} failed: {e}")
+    # Drop the supervisor sockets. detach() is idempotent if already done.
     for sess in sessions.values():
-        sess.detach()
+        try:
+            sess.detach()
+        except Exception:
+            pass
     server.close()
     if os.path.exists(SOCKET_PATH):
         os.unlink(SOCKET_PATH)
-    log.info("Shutdown — sessions detached, supervisors keep running")
+    log.info("Shutdown — AI children terminated gracefully, sockets closed")
 
 
 if __name__ == "__main__":
