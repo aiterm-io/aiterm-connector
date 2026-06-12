@@ -76,6 +76,15 @@ write_units() {
     PTY_OLD=$(md5sum "$SVC_DIR/aiterm-pty.service" 2>/dev/null | awk '{print $1}')
     CONN_OLD=$(md5sum "$SVC_DIR/aiterm-connector.service" 2>/dev/null | awk '{print $1}')
 
+    # ProtectKernelLogs needs systemd >= 244 (Rocky 8 ships 239, would emit
+    # "Unknown lvalue" warnings to the journal). Detect once and gate the
+    # directive — service stays hardened on modern systemd, silent on old.
+    local SYSTEMD_VER PROTECT_KERNEL_LOGS=""
+    SYSTEMD_VER=$(systemctl --version 2>/dev/null | awk 'NR==1{print $2}')
+    if [ -n "$SYSTEMD_VER" ] && [ "$SYSTEMD_VER" -ge 244 ] 2>/dev/null; then
+        PROTECT_KERNEL_LOGS="${PROTECT_KERNEL_LOGS}"
+    fi
+
     if [ "$MODE" = "system" ]; then
         cat > "$SVC_DIR/aiterm-pty.service" << SVCEOF
 [Unit]
@@ -98,7 +107,7 @@ TimeoutStopSec=10
 # Hardening (minimal: must spawn user shells with full fs access & setuid/sudo)
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
-ProtectKernelLogs=yes
+${PROTECT_KERNEL_LOGS}
 ProtectControlGroups=yes
 LockPersonality=yes
 RestrictRealtime=yes
@@ -123,7 +132,7 @@ PrivateTmp=yes
 ProtectHome=read-only
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
-ProtectKernelLogs=yes
+${PROTECT_KERNEL_LOGS}
 ProtectControlGroups=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
@@ -150,7 +159,7 @@ TimeoutStopSec=10
 # Hardening (minimal: must spawn user shells)
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
-ProtectKernelLogs=yes
+${PROTECT_KERNEL_LOGS}
 ProtectControlGroups=yes
 LockPersonality=yes
 RestrictRealtime=yes
@@ -174,7 +183,7 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
-ProtectKernelLogs=yes
+${PROTECT_KERNEL_LOGS}
 ProtectControlGroups=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
@@ -274,19 +283,119 @@ ensure_python_deps() {
     # Required BEFORE signed_download can run.
     command -v python3 >/dev/null 2>&1 || {
         if [ "$MODE" = "system" ]; then
-            apt-get update -qq && apt-get install -y -qq python3 2>/dev/null || fail "python3 not available"
+            (apt-get update -qq 2>/dev/null && apt-get install -y -qq python3 2>/dev/null) \
+                || dnf install -y python3 2>/dev/null \
+                || fail "python3 not available — install via your package manager"
         else
             fail "python3 required; install it first (e.g. sudo apt install python3)"
         fi
     }
-    python3 -c "import websockets" 2>/dev/null || \
-        python3 -m pip install --quiet --break-system-packages websockets 2>/dev/null || \
-        pip3 install --quiet --break-system-packages websockets 2>/dev/null || \
-        fail "websockets install failed"
-    python3 -c "from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey" 2>/dev/null || \
-        python3 -m pip install --quiet --break-system-packages cryptography 2>/dev/null || \
-        pip3 install --quiet --break-system-packages cryptography 2>/dev/null || \
-        fail "cryptography install failed (required for signed-update verification)"
+
+    # What's missing right now?
+    local need_ws need_crypto pkg_mgr=""
+    python3 -c "import websockets" 2>/dev/null && need_ws=0 || need_ws=1
+    python3 -c "from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey" 2>/dev/null \
+        && need_crypto=0 || need_crypto=1
+    [ "$need_ws" = 0 ] && [ "$need_crypto" = 0 ] && return 0
+
+    if command -v apt-get >/dev/null 2>&1; then pkg_mgr=apt
+    elif command -v dnf >/dev/null 2>&1; then pkg_mgr=dnf
+    elif command -v zypper >/dev/null 2>&1; then pkg_mgr=zypper
+    elif command -v pacman >/dev/null 2>&1; then pkg_mgr=pacman
+    elif command -v apk >/dev/null 2>&1; then pkg_mgr=apk
+    fi
+
+    # Step 1: distro packages first — clean install everywhere we can,
+    # no PEP-668 friction, no pip dependency. Each distro family uses
+    # slightly different package names:
+    #   apt/dnf/zypper:  python3-websockets, python3-cryptography
+    #   pacman:          python-websockets, python-cryptography  (Arch's python IS python3)
+    #   apk:             py3-websockets, py3-cryptography        (Alpine convention)
+    if [ -n "$pkg_mgr" ]; then
+        local ws_pkg crypto_pkg pkgs=""
+        case "$pkg_mgr" in
+            apt|dnf|zypper) ws_pkg=python3-websockets; crypto_pkg=python3-cryptography ;;
+            pacman)         ws_pkg=python-websockets;  crypto_pkg=python-cryptography  ;;
+            apk)            ws_pkg=py3-websockets;     crypto_pkg=py3-cryptography     ;;
+        esac
+        [ "$need_ws" = 1 ]     && pkgs="$pkgs $ws_pkg"
+        [ "$need_crypto" = 1 ] && pkgs="$pkgs $crypto_pkg"
+        if [ -n "$pkgs" ]; then
+            case "$pkg_mgr" in
+                apt)
+                    apt-get update -qq 2>/dev/null || true
+                    # shellcheck disable=SC2086
+                    apt-get install -y -qq $pkgs 2>/dev/null || true ;;
+                dnf)
+                    # shellcheck disable=SC2086
+                    dnf install -y $pkgs 2>/dev/null || true ;;
+                zypper)
+                    # shellcheck disable=SC2086
+                    zypper --non-interactive install -y $pkgs 2>/dev/null || true ;;
+                pacman)
+                    # -Sy refreshes the package db (Arch needs this on fresh boxes
+                    # or rolling repos go stale fast). --noconfirm avoids prompts.
+                    pacman -Sy --noconfirm --needed --quiet 2>/dev/null || true
+                    # shellcheck disable=SC2086
+                    pacman -S --noconfirm --needed --quiet $pkgs 2>/dev/null || true ;;
+                apk)
+                    # --no-cache: don't store the index, keep the image lean.
+                    # Standard Alpine container/box idiom.
+                    # shellcheck disable=SC2086
+                    apk add --no-cache $pkgs 2>/dev/null || true ;;
+            esac
+        fi
+        python3 -c "import websockets" 2>/dev/null && need_ws=0
+        python3 -c "from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey" 2>/dev/null \
+            && need_crypto=0
+    fi
+    [ "$need_ws" = 0 ] && [ "$need_crypto" = 0 ] && return 0
+
+    # Step 2: pip fallback. Ensure pip exists first — Debian doesn't ship it
+    # by default, which is exactly how customers hit "websockets install failed"
+    # with zero info: all three pip attempts ran against a missing pip module.
+    if ! python3 -m pip --version >/dev/null 2>&1; then
+        case "$pkg_mgr" in
+            apt)    apt-get install -y -qq python3-pip 2>/dev/null || true ;;
+            dnf)    dnf install -y python3-pip 2>/dev/null || true ;;
+            zypper) zypper --non-interactive install -y python3-pip 2>/dev/null || true ;;
+            pacman) pacman -S --noconfirm --needed --quiet python-pip 2>/dev/null || true ;;
+            apk)    apk add --no-cache py3-pip 2>/dev/null || true ;;
+        esac
+    fi
+    python3 -m pip --version >/dev/null 2>&1 \
+        || fail "pip is not available. Install via your package manager: apt/dnf/zypper install python3-pip, pacman -S python-pip, or apk add py3-pip."
+
+    # --break-system-packages only exists on pip >= 23.0 (PEP 668 era). Older
+    # pip doesn't enforce PEP 668 anyway, so we skip the flag for it — using
+    # the flag with an older pip aborts with "no such option" (seen on
+    # OpenSUSE Leap, RHEL 8, older Debian).
+    local pip_bsp=""
+    if python3 -m pip install --help 2>&1 | grep -q -- "--break-system-packages"; then
+        pip_bsp="--break-system-packages"
+    fi
+
+    # Step 3: pip install. Show real stderr on failure so the customer sees why.
+    local pip_err="/tmp/aiterm-pip-err.$$"
+    trap 'rm -f "$pip_err"' RETURN
+    if [ "$need_ws" = 1 ]; then
+        # shellcheck disable=SC2086
+        if ! python3 -m pip install --quiet $pip_bsp websockets 2>"$pip_err"; then
+            echo "" >&2
+            echo "  pip install websockets failed. Output:" >&2
+            sed 's/^/    /' "$pip_err" >&2
+            fail "websockets install failed (see error above)"
+        fi
+    fi
+    if [ "$need_crypto" = 1 ]; then
+        # shellcheck disable=SC2086
+        if ! python3 -m pip install --quiet $pip_bsp cryptography 2>"$pip_err"; then
+            echo "" >&2
+            echo "  pip install cryptography failed. Output:" >&2
+            sed 's/^/    /' "$pip_err" >&2
+            fail "cryptography install failed (see error above)"
+        fi
+    fi
 }
 
 # Check for existing installations first
@@ -295,11 +404,22 @@ EXISTING_SYSTEM=0; EXISTING_USER=0
 [ -f "$HOME/.local/share/aiterm/connector.json" ] && EXISTING_USER=1
 
 if [ "$EXISTING_SYSTEM" -eq 1 ] || [ "$EXISTING_USER" -eq 1 ]; then
-    # Update mode — use existing paths
-    if [ "$EXISTING_SYSTEM" -eq 1 ]; then
+    # Update mode — pick the install path that matches the CURRENT user.
+    # Both can coexist on the same box (root has /opt/aiterm, non-root user
+    # has their own ~/.local/share/aiterm). Picking system unconditionally
+    # makes a non-root invocation crash with "Permission denied" on the
+    # first cp to /opt/aiterm/.
+    if [ "$(id -u)" -eq 0 ] && [ "$EXISTING_SYSTEM" -eq 1 ]; then
+        # Root + system-wide install present -> update system
         MODE="system"; INSTALL_DIR="/opt/aiterm"; BIN_DIR="/usr/local/bin"; SVC_CMD="systemctl"
-    else
+    elif [ "$EXISTING_USER" -eq 1 ]; then
+        # User install present (and either we're non-root, or we're root
+        # without a system install) -> update the per-user install
         setup_user_mode "$(whoami)"
+    else
+        # Only system install exists, but we're non-root. Can't touch
+        # /opt/aiterm/ from here.
+        fail "A system-wide install exists at /opt/aiterm/ but you don't have write access to it. Re-run as root with sudo, or have your admin do the update."
     fi
 elif [ "$(id -u)" -eq 0 ]; then
     # Root: ask for mode
@@ -452,14 +572,29 @@ if [ -f "$INSTALL_DIR/connector.json" ] && [ -f "$INSTALL_DIR/connector.py" ] &&
         pkill -f "python3.*$INSTALL_DIR/connector.py" 2>/dev/null
         rm -f "$INSTALL_DIR/pty.sock" "$INSTALL_DIR/connector.lock" 2>/dev/null
         sleep 1
-        if command -v aiterm &>/dev/null; then
+        # Use $SVC_CMD directly. Earlier we used `aiterm start` here, but
+        # the aiterm CLI auto-detects /opt/aiterm even from a non-root
+        # shell when both system + user installs coexist — polkit then
+        # demands root and the start fails. $SVC_CMD already encodes
+        # whether we should hit system or user systemd.
+        $SVC_CMD start aiterm-pty 2>/dev/null || true
+        sleep 1
+        $SVC_CMD start aiterm-connector 2>/dev/null || true
+        sleep 1
+        if $SVC_CMD is-active --quiet aiterm-connector 2>/dev/null; then
+            RESTARTED=1
+            ok "Connector started"
+        elif command -v aiterm &>/dev/null && [ "$MODE" = "system" ] && [ "$(id -u)" -eq 0 ]; then
+            # Last-resort fallback: only when we're definitely going to
+            # hit the right install via the CLI.
             aiterm start && RESTARTED=1
         else
+            # Bare-process fallback (no systemd available, e.g. WSL1)
             nohup "$PY" "$INSTALL_DIR/pty-manager.py" >> "$INSTALL_DIR/connector.log" 2>&1 &
             sleep 1
             nohup "$PY" "$INSTALL_DIR/connector.py" >> "$INSTALL_DIR/connector.log" 2>&1 &
             RESTARTED=1
-            ok "Connector started"
+            ok "Connector started (no systemd, processes spawned directly)"
         fi
     fi
 
@@ -500,7 +635,7 @@ cleanup_on_fail() {
     # Best-effort service restart so the customer is not stuck.
     $SVC_CMD start aiterm-pty aiterm-connector 2>/dev/null || true
     rm -f "$BACKUP_JSON" 2>/dev/null
-    echo -e "${DIM}  Retry with:  curl -sSL https://aiterm.io/pair | sh${NC}"
+    echo -e "${DIM}  Retry with:  curl -sSL https://aiterm.io/install | bash${NC}"
     echo ""
     exit $rc
 }
@@ -738,7 +873,7 @@ trap - EXIT
 echo ""
 if [ "$IS_REPAIR" = "1" ]; then
     echo -e "  ${GREEN}${BOLD}Re-paired.${NC} Machine reconnected under the new token."
-    echo -e "  ${DIM}The old entry may show as 'offline' in the dashboard — you can remove it with the 'Entfernen' button.${NC}"
+    echo -e "  ${DIM}The old entry may show as 'offline' in the dashboard — you can remove it with the 'Remove' button.${NC}"
 else
     echo -e "  ${GREEN}${BOLD}Done!${NC} Machine will appear in the dashboard."
 fi

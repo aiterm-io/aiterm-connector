@@ -26,7 +26,7 @@ The installer asks whether to install **system-wide** (`/opt/aiterm`, systemd at
 
 ## Requirements
 
-- Python 3.8+
+- Python 3.9+
 - `websockets`, `cryptography` (installed automatically)
 - `systemd` (optional — installer falls back to `nohup` otherwise)
 
