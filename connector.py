@@ -12,7 +12,7 @@ Usage:
 Requires: pip3 install websockets
 """
 
-CONNECTOR_VERSION = "2026.06.12.1"
+CONNECTOR_VERSION = "2026.06.12.2"
 
 # Ed25519 public key for manifest signature verification. Updates whose
 # manifest.sig does not verify against this key are rejected. Rotation
@@ -538,6 +538,109 @@ async def watch_honeytokens(send_fn, paths, poll_seconds=60):
 # ─── PTY Manager Relay ────────────────────────────────────────
 PTY_SOCKET = str(Path(BASE_DIR) / "pty.sock")
 
+
+async def _connect_pty_socket(retries=14, base_delay=0.25, cap=1.0):
+    """Connect to the PTY-manager unix socket with bounded retry + backoff.
+
+    The single biggest reliability bug was a ONE-SHOT connect here: after a
+    restart or self-update the pty-manager may still be binding pty.sock, so a
+    single failed attempt left the connector 'online but dead' — connected to
+    the hub but silently dropping every terminal command. Retrying briefly
+    turns that startup race into a non-event. Returns (reader, writer) or
+    (None, None) if the manager is genuinely down after the budget."""
+    delay = base_delay
+    for attempt in range(retries):
+        try:
+            r, w = await asyncio.open_unix_connection(PTY_SOCKET)
+            if attempt:
+                log.info(f"Connected to PTY manager (after {attempt + 1} attempts)")
+            return r, w
+        except Exception as e:
+            if attempt == retries - 1:
+                log.warning(f"PTY manager not available after {retries} attempts: {e}")
+                return None, None
+            await asyncio.sleep(min(delay, cap))
+            delay *= 1.5
+
+
+async def _pty_to_hub(reader, ws):
+    """Relay every line the PTY-manager emits straight to the hub WS."""
+    if not reader:
+        return
+    try:
+        while True:
+            line = await reader.readline()
+            if not line:
+                break
+            await ws.send(line.decode().rstrip("\n"))
+    except (asyncio.CancelledError, ConnectionResetError,
+            websockets.ConnectionClosed):
+        pass
+
+
+async def _attach_pty(state, ws, retries=14):
+    """(Re)connect pty.sock into `state` ({reader, writer, relay}), drain the
+    initial session list + scrollback, and (re)start the relay task. Returns
+    True on success. Used at startup AND for lazy reconnect when a command
+    arrives but the backend has gone away."""
+    r, w = await _connect_pty_socket(retries=retries)
+    if not r:
+        return False
+    state["reader"], state["writer"] = r, w
+    log.info("Connected to PTY manager")
+    # Initial session list → 'started' events (reattach view).
+    try:
+        line = await asyncio.wait_for(r.readline(), timeout=3)
+        msg = json.loads(line)
+        if msg.get("t") == "sessions":
+            for sess in msg.get("sessions", []):
+                await ws.send(json.dumps({
+                    "t": "started", "sid": sess["sid"],
+                    "ai": os.path.basename(sess.get("cmd", "unknown")),
+                    "name": os.path.basename(sess.get("cmd", "AI")),
+                    "cwd": sess.get("cwd", ""),
+                }))
+    except Exception:
+        pass
+    # Drain any buffered scrollback.
+    try:
+        while True:
+            line = await asyncio.wait_for(r.readline(), timeout=0.5)
+            if not line:
+                break
+            msg = json.loads(line)
+            if msg.get("t") == "o":
+                await ws.send(json.dumps(msg))
+            else:
+                break
+    except (asyncio.TimeoutError, Exception):
+        pass
+    if state.get("relay"):
+        state["relay"].cancel()
+    state["relay"] = asyncio.ensure_future(_pty_to_hub(r, ws))
+    return True
+
+
+async def _ensure_pty(state, ws, sid=""):
+    """Lazy reconnect for a command that arrived while the PTY backend was
+    unavailable (shorter budget than startup). On failure tell the dashboard
+    instead of silently dropping — this is what turned 'online but dead' into
+    a visible error."""
+    if state.get("writer") is not None:
+        return True
+    ok = await _attach_pty(state, ws, retries=6)
+    if not ok:
+        try:
+            await ws.send(json.dumps({"t": "toast",
+                "msg": "Terminal backend not reachable on this machine — retrying."}))
+            if sid:
+                await ws.send(json.dumps({"t": "err", "sid": sid,
+                    "m": "terminal backend not reachable"}))
+        except Exception:
+            pass
+    return ok
+
+
 def _spki_hash_from_der(cert_der):
     """Return sha256(SubjectPublicKeyInfo) hex for the given DER cert.
     Used to pin the server's public key, not the whole cert — the SPKI
@@ -730,59 +833,13 @@ async def push_to_hub(config):
                 }))
                 log.info(f"Connected to hub as '{config.get('name', '?')}'")
 
-                # Connect to PTY manager
-                pty_reader = pty_writer = None
-                try:
-                    pty_reader, pty_writer = await asyncio.open_unix_connection(PTY_SOCKET)
-                    log.info("Connected to PTY manager")
-                except Exception as e:
-                    log.warning(f"PTY manager not available: {e}")
-
-                # If PTY manager connected, read initial session list and relay
-                if pty_reader:
-                    try:
-                        line = await asyncio.wait_for(pty_reader.readline(), timeout=3)
-                        msg = json.loads(line)
-                        if msg.get("t") == "sessions":
-                            for sess in msg.get("sessions", []):
-                                await ws.send(json.dumps({
-                                    "t": "started", "sid": sess["sid"],
-                                    "ai": os.path.basename(sess.get("cmd", "unknown")),
-                                    "name": os.path.basename(sess.get("cmd", "AI")),
-                                    "cwd": sess.get("cwd", ""),
-                                }))
-                    except Exception:
-                        pass
-
-                    # Read scrollback
-                    try:
-                        while True:
-                            line = await asyncio.wait_for(pty_reader.readline(), timeout=0.5)
-                            if not line:
-                                break
-                            msg = json.loads(line)
-                            if msg.get("t") == "o":
-                                await ws.send(json.dumps(msg))
-                            else:
-                                break
-                    except (asyncio.TimeoutError, Exception):
-                        pass
-
-                # PTY → Hub relay task (explicit params avoid closure-over-loop-variable)
-                async def pty_to_hub(reader, sock):
-                    if not reader:
-                        return
-                    try:
-                        while True:
-                            line = await reader.readline()
-                            if not line:
-                                break
-                            await sock.send(line.decode().rstrip("\n"))
-                    except (asyncio.CancelledError, ConnectionResetError,
-                            websockets.ConnectionClosed):
-                        pass
-
-                relay_task = asyncio.ensure_future(pty_to_hub(pty_reader, ws))
+                # ── PTY manager connection (retry-robust + lazily reattachable) ──
+                # State in a dict so the module-level helpers can mutate it
+                # without closing over loop variables. `pty_writer` is a
+                # convenience snapshot, re-synced after every (re)attach.
+                pty = {"reader": None, "writer": None, "relay": None}
+                await _attach_pty(pty, ws)
+                pty_writer = pty["writer"]
 
                 # Honeytoken watcher — runs for the lifetime of this WS session.
                 # Sends alert messages through the same ws. Paths come from
@@ -800,6 +857,18 @@ async def push_to_hub(config):
                             continue
                         t = msg.get("t")
                         sid = msg.get("sid", "")
+
+                        # If a PTY-bound command arrives but the backend is not
+                        # attached (startup race, or pty-manager restarted under
+                        # us), try a lazy reconnect first. ensure_pty() reports a
+                        # toast to the dashboard on failure so the command is
+                        # never silently swallowed.
+                        _PTY_CMDS = ("start_ai", "stop_ai", "kill_all", "i", "r",
+                                     "guard_response", "set_guard")
+                        if t in _PTY_CMDS and pty["writer"] is None:
+                            if not await _ensure_pty(pty, ws, sid):
+                                continue
+                            pty_writer = pty["writer"]  # re-sync after reconnect
 
                         # ── Commands that go to PTY manager ──
                         if t == "start_ai" and pty_writer:
@@ -967,14 +1036,15 @@ async def push_to_hub(config):
                             await ws.send(json.dumps({"t": "up", "path": str(fpath), "name": name, "size": len(file_bytes)}))
 
                 finally:
-                    relay_task.cancel()
+                    if pty.get("relay"):
+                        pty["relay"].cancel()
                     try:
                         ht_task.cancel()
                     except NameError:
                         pass
-                    if pty_writer:
+                    if pty.get("writer"):
                         try:
-                            pty_writer.close()
+                            pty["writer"].close()
                         except Exception:
                             pass
 
@@ -1206,15 +1276,54 @@ def self_update():
     else:
         # Per-user install OR running as the right user — use --user systemd.
         systemctl_cmd = ["systemctl", "--user"]
-    for svc in ["aiterm-connector", "aiterm-pty"]:
+    # Restart ORDER matters. Bring the PTY-manager up FIRST so it rebinds
+    # pty.sock, wait until that socket actually accepts a connection, and only
+    # THEN restart the connector — which restarts THIS process, so it must be
+    # last (any step after it may never execute). The previous order
+    # (connector first) could leave the connector reconnected to a dying
+    # pty-manager, or skip the pty restart entirely — a cause of the
+    # post-update "online but dead" state.
+    def _is_active(svc):
         try:
             r = subprocess.run(systemctl_cmd + ["is-active", svc],
-                                capture_output=True, text=True, timeout=5)
-            if r.stdout.strip() == "active":
-                subprocess.run(systemctl_cmd + ["restart", svc], timeout=10)
-                print(f"  \033[0;32m✓\033[0m {svc} restarted")
+                               capture_output=True, text=True, timeout=5)
+            return r.stdout.strip() == "active"
+        except Exception:
+            return False
+
+    def _wait_pty_sock(timeout=10.0):
+        import socket as _socket
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+                s.settimeout(1.0)
+                s.connect(PTY_SOCKET)
+                s.close()
+                return True
+            except Exception:
+                time.sleep(0.3)
+        return False
+
+    # 1) PTY-manager first — rebind pty.sock before the connector reconnects.
+    if _is_active("aiterm-pty"):
+        try:
+            subprocess.run(systemctl_cmd + ["restart", "aiterm-pty"], timeout=15)
+            print("  \033[0;32m✓\033[0m aiterm-pty restarted")
+            if _wait_pty_sock():
+                print("  \033[0;32m✓\033[0m pty.sock ready")
+            else:
+                print("  \033[2m· pty.sock not ready yet — connector will retry on connect\033[0m")
         except Exception as e:
-            print(f"  \033[2m· {svc}: restart skipped ({e})\033[0m")
+            print(f"  \033[2m· aiterm-pty: restart skipped ({e})\033[0m")
+
+    # 2) Connector LAST — this restarts the current process.
+    if _is_active("aiterm-connector"):
+        try:
+            subprocess.run(systemctl_cmd + ["restart", "aiterm-connector"], timeout=10)
+            print("  \033[0;32m✓\033[0m aiterm-connector restarted")
+        except Exception as e:
+            print(f"  \033[2m· aiterm-connector: restart skipped ({e})\033[0m")
 
     print("\n  Update complete.\n")
     return 0
