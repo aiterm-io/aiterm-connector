@@ -93,6 +93,10 @@ After=network.target
 [Service]
 Type=simple
 ExecStart=/usr/bin/python3 $INSTALL_DIR/pty-manager.py
+# Gate readiness on pty.sock actually existing: with Type=simple the connector
+# (ordered After=) would otherwise start the instant this process forks, before
+# the socket is bound — the classic startup race. Wait up to ~5s for the socket.
+ExecStartPost=/bin/sh -c 'i=0; until [ -S "$INSTALL_DIR/pty.sock" ] || [ \$i -ge 50 ]; do i=\$((i+1)); sleep 0.1; done'
 WorkingDirectory=$INSTALL_DIR
 Restart=always
 RestartSec=3
@@ -148,6 +152,8 @@ Description=AITerm PTY Manager
 [Service]
 Type=simple
 ExecStart=/usr/bin/python3 $INSTALL_DIR/pty-manager.py
+# Wait for pty.sock before the After=-ordered connector starts (see system unit).
+ExecStartPost=/bin/sh -c 'i=0; until [ -S "$INSTALL_DIR/pty.sock" ] || [ \$i -ge 50 ]; do i=\$((i+1)); sleep 0.1; done'
 WorkingDirectory=$INSTALL_DIR
 Restart=always
 RestartSec=3
