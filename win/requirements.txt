@@ -1,0 +1,8 @@
+# AITerm Windows Connector — Python dependencies for M1.
+#
+# Tested with Python 3.11 (Windows 10 1809+ / Windows 11).
+# Earlier 3.x should work but is untested.
+
+websockets>=12.0
+pywinpty>=2.0.13   # ConPTY wrapper; ships prebuilt wheels for Win10+
+cryptography>=42.0 # used in M2 for manifest signature verification

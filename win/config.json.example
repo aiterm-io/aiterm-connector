@@ -1,0 +1,6 @@
+{
+  "hub_url": "wss://www.aiterm.io/connector",
+  "hub_token": "PASTE-TOKEN-FROM-PAIRING-HERE",
+  "name": "my-windows-box",
+  "default_cwd": "C:\\Users\\me"
+}
