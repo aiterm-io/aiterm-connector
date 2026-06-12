@@ -12,7 +12,7 @@ Usage:
 Requires: pip3 install websockets
 """
 
-CONNECTOR_VERSION = "2026.04.26.2"
+CONNECTOR_VERSION = "2026.06.12.1"
 
 # Ed25519 public key for manifest signature verification. Updates whose
 # manifest.sig does not verify against this key are rejected. Rotation
@@ -26,6 +26,7 @@ import json
 import logging
 import os
 import platform
+import random
 import shutil
 import signal
 import subprocess
@@ -563,14 +564,31 @@ async def push_to_hub(config):
     one `connector_invalid_token` security-log entry per try. With fail2ban's
     aiterm jail at maxretry=5/findtime=10min, the customer's own Public-IP
     gets banned by their own connector within 2-3 minutes — they then
-    can't reach aiterm.io at all from that machine until the bantime expires.
+    can't reach the hub at all from that machine until the bantime expires.
     Backoff prevents the trap; user sees the clear log message and runs
     `aiterm pair` to fix the underlying token issue."""
     hub_url = config["hub_url"]
     hub_token = config["hub_token"]
     upload_dir = Path(config["upload_dir"])
 
+    # FAIL-CLOSED: TLS certificate pinning is a stated security guarantee, and it
+    # depends on `cryptography`. If we're about to use wss:// but cryptography is
+    # missing, we would silently run UNPINNED (the old behaviour: a WARNING and
+    # carry on). Refuse instead — an operator who can't pin must know it, not
+    # discover it after a MITM. The installer always provisions cryptography, so
+    # this only trips on a broken/hand-rolled environment.
+    if hub_url.startswith("wss://"):
+        try:
+            import cryptography  # noqa: F401
+        except ImportError:
+            log.error("FATAL: 'cryptography' is required for TLS certificate pinning on "
+                      "wss:// connections but is not installed. Refusing to connect "
+                      "unpinned. Install it: pip install cryptography (the installer "
+                      "normally does this automatically).")
+            sys.exit(1)
+
     auth_fail_count = 0  # consecutive auth failures
+    conn_fail_count = 0  # consecutive connection losses (non-auth)
     while True:
         try:
             ssl_ctx = None
@@ -579,12 +597,27 @@ async def push_to_hub(config):
                 import hashlib as _hl
                 ssl_ctx = _ssl.create_default_context()
 
-            log.info(f"Connecting to hub: {hub_url}")
-            async with websockets.connect(
-                hub_url, max_size=25*1024*1024,
+            # Build kwargs version-aware. The `open_timeout` kwarg only exists
+            # in websockets >= 10.0 (released Sep 2021). OpenSUSE Leap 15.5 and
+            # other distros stuck on Python 3.6 ship websockets 9.x via their
+            # repos, and websockets 10+ requires Python 3.7+ — so we can't just
+            # upgrade. Detect and skip the kwarg on old versions; the TCP
+            # connect uses socket defaults, slightly less responsive on dead
+            # networks but functional.
+            ws_kwargs = dict(
+                max_size=25*1024*1024,
                 ping_interval=30, ping_timeout=10,
-                open_timeout=10, ssl=ssl_ctx,
-            ) as ws:
+                ssl=ssl_ctx,
+            )
+            try:
+                _ws_major = int(websockets.__version__.split(".")[0])
+            except (AttributeError, ValueError):
+                _ws_major = 0
+            if _ws_major >= 10:
+                ws_kwargs["open_timeout"] = 10
+
+            log.info(f"Connecting to hub: {hub_url}")
+            async with websockets.connect(hub_url, **ws_kwargs) as ws:
                 # Certificate pinning (TOFU: Trust On First Use).
                 #
                 # Pin on Subject Public Key Info (SPKI), not full DER. The
@@ -632,8 +665,23 @@ async def push_to_hub(config):
                                 log.info(f"Certificate pinned (SPKI): {spki_hash[:16]}...")
                     except SystemExit:
                         raise
+                    except ImportError as e:
+                        # cryptography vanished between the startup gate and here
+                        # (env tampering / partial uninstall). Never downgrade a
+                        # crypto failure to a warning — refuse the connection.
+                        log.error(f"FATAL: cryptography unavailable during pin check — "
+                                  f"refusing unpinned connection: {e}")
+                        try:
+                            await ws.close()
+                        except Exception:
+                            pass
+                        sys.exit(1)
                     except Exception as e:
-                        log.warning(f"Certificate pinning check failed: {e}")
+                        # Incidental failure (e.g. transport/ssl_object quirk on an
+                        # old websockets build, or a pin-file write error). The TLS
+                        # handshake itself was still CA-validated by the default
+                        # context, so we proceed — but make the gap visible.
+                        log.warning(f"Certificate pin check skipped (CA-validated TLS still active): {e}")
                 # Auth
                 await ws.send(json.dumps({"t": "auth", "token": hub_token}))
                 resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
@@ -651,8 +699,24 @@ async def push_to_hub(config):
                     )
                     await asyncio.sleep(backoff)
                     continue
-                # Auth succeeded → reset the backoff counter.
+                # Auth succeeded → reset both backoff counters.
                 auth_fail_count = 0
+                conn_fail_count = 0
+
+                # Detect install context so the hub can distinguish
+                # parallel root + per-user installs on the same hostname
+                # (otherwise they show up as two identically-named machines
+                # in the dashboard with no visible difference).
+                try:
+                    import getpass as _gp
+                    _run_user = _gp.getuser()
+                except Exception:
+                    _run_user = os.environ.get("USER") or os.environ.get("USERNAME") or "?"
+                _is_root_system = (
+                    hasattr(os, "geteuid") and os.geteuid() == 0
+                    and str(BASE_DIR) in ("/opt/aiterm", "/usr/local/share/aiterm")
+                )
+                _install_mode = "system" if _is_root_system else "user"
 
                 # Info
                 await ws.send(json.dumps({
@@ -660,6 +724,9 @@ async def push_to_hub(config):
                     "name": config.get("name", platform.node()),
                     "version": CONNECTOR_VERSION,
                     "scan": {},
+                    "install_mode": _install_mode,
+                    "run_user": _run_user,
+                    "install_dir": str(BASE_DIR),
                 }))
                 log.info(f"Connected to hub as '{config.get('name', '?')}'")
 
@@ -715,7 +782,7 @@ async def push_to_hub(config):
                             websockets.ConnectionClosed):
                         pass
 
-                relay_task = asyncio.create_task(pty_to_hub(pty_reader, ws))
+                relay_task = asyncio.ensure_future(pty_to_hub(pty_reader, ws))
 
                 # Honeytoken watcher — runs for the lifetime of this WS session.
                 # Sends alert messages through the same ws. Paths come from
@@ -723,7 +790,7 @@ async def push_to_hub(config):
                 ht_paths = config.get("_honeytoken_paths", [])
                 async def _ht_send(ev):
                     await ws.send(json.dumps(ev))
-                ht_task = asyncio.create_task(watch_honeytokens(_ht_send, ht_paths))
+                ht_task = asyncio.ensure_future(watch_honeytokens(_ht_send, ht_paths))
 
                 try:
                     async for raw in ws:
@@ -776,7 +843,13 @@ async def push_to_hub(config):
                             pty_writer.write((json.dumps({"t": "kill_all"}) + "\n").encode())
                             await pty_writer.drain()
                         elif t == "i" and sid and pty_writer:
-                            pty_writer.write((json.dumps({"t": "input", "sid": sid, "d": msg["d"]}) + "\n").encode())
+                            # Preserve the input source tag (src=="mcp" → AI-piloted)
+                            # so the PTY-manager's Guard Mode can apply the stricter
+                            # pattern scope to AI-driven commands.
+                            _in = {"t": "input", "sid": sid, "d": msg["d"]}
+                            if msg.get("src"):
+                                _in["src"] = msg["src"]
+                            pty_writer.write((json.dumps(_in) + "\n").encode())
                             await pty_writer.drain()
                         elif t == "r" and sid and pty_writer:
                             pty_writer.write((json.dumps({"t": "resize", "sid": sid, "rows": msg.get("rows", 30), "cols": msg.get("cols", 120)}) + "\n").encode())
@@ -786,6 +859,20 @@ async def push_to_hub(config):
                             await pty_writer.drain()
                         elif t == "set_guard" and sid and pty_writer:
                             pty_writer.write((json.dumps({"t": "set_guard", "sid": sid, "enabled": bool(msg.get("enabled", False))}) + "\n").encode())
+                            await pty_writer.drain()
+
+                        elif t == "scan_processes" and pty_writer:
+                            # Forward to pty-manager; inventory comes back as
+                            # {"t": "process_inventory", "processes": [...]}.
+                            pty_writer.write((json.dumps({"t": "scan_processes"}) + "\n").encode())
+                            await pty_writer.drain()
+
+                        elif t == "cleanup_processes" and pty_writer:
+                            pty_writer.write((json.dumps({
+                                "t": "cleanup_processes",
+                                "pids": msg.get("pids", []),
+                                "force": bool(msg.get("force", False)),
+                            }) + "\n").encode())
                             await pty_writer.drain()
 
                         # ── Handled locally by connector ──
@@ -812,9 +899,21 @@ async def push_to_hub(config):
                         elif t == "remote_update":
                             log.info("Remote update requested")
                             await ws.send(json.dumps({"t": "update_status", "status": "updating"}))
+                            # Run self_update in the default executor so the
+                            # blocking urllib downloads don't freeze the WS
+                            # heartbeat, and capture its exit code → report
+                            # back to dashboard so the user sees success or
+                            # failure instead of an indefinite "Updating...".
                             try:
-                                self_update()
+                                loop = asyncio.get_event_loop()
+                                rc = await loop.run_in_executor(None, self_update)
+                                if rc == 0:
+                                    await ws.send(json.dumps({"t": "update_status", "status": "done"}))
+                                else:
+                                    await ws.send(json.dumps({"t": "update_status", "status": "error",
+                                                                "m": f"self_update returned {rc} — check journalctl -u aiterm-connector on the machine"}))
                             except Exception as e:
+                                log.exception("self_update raised")
                                 await ws.send(json.dumps({"t": "update_status", "status": "error", "m": str(e)}))
 
                         elif t == "remote_uninstall":
@@ -883,7 +982,18 @@ async def push_to_hub(config):
             break
         except Exception as e:
             log.warning(f"Hub connection lost: {e}")
-        await asyncio.sleep(5)
+        # Reconnect with exponential backoff + jitter instead of a flat 5 s.
+        # When the hub restarts (e.g. a substrate update), every connector
+        # would otherwise stampede back at the same instant and overwhelm the
+        # recovering hub — which is exactly how a machine "won't re-dock after
+        # an update". Backoff spreads the herd; the jitter de-synchronises
+        # connectors; the counter resets to 0 the moment auth succeeds, so a
+        # one-off blip still recovers fast. Cap 60 s, half-to-full jitter.
+        conn_fail_count += 1
+        ceil = min(60, 2 * (2 ** min(conn_fail_count - 1, 5)))
+        delay = random.uniform(ceil / 2, ceil)
+        log.info(f"Reconnecting in {delay:.1f}s (attempt {conn_fail_count})")
+        await asyncio.sleep(delay)
 
 # ─── Main ────────────────────────────────────────────────────
 def acquire_lock(lock_path):
@@ -940,7 +1050,8 @@ async def main():
     if not config.get("hub_url") or not config.get("hub_token"):
         log.error("hub_url and hub_token required in connector.json")
         print("  ERROR: No hub_url/hub_token configured.", flush=True)
-        print("  Run the installer: curl -sL https://aiterm.io/install | bash", flush=True)
+        print("  Re-run your hub's pairing installer (the one-line `curl ... | bash`", flush=True)
+        print("  command you originally received) to register this machine.", flush=True)
         return
 
     # Honeytokens: deployment happens at install time (see install.sh), which
@@ -953,7 +1064,7 @@ async def main():
     print(f"  │  Hub:      {mode_str:<36}│", flush=True)
     print("  └───────────────────────────────────────────────┘", flush=True)
     print(flush=True)
-    push_task = asyncio.create_task(push_to_hub(config))
+    push_task = asyncio.ensure_future(push_to_hub(config))
     await stop
     push_task.cancel()
 
@@ -969,15 +1080,22 @@ def self_update():
     install_dir = Path(__file__).parent
     config_path = install_dir / "connector.json"
 
+    # Update channel is *the same host as the hub*.  A paired connector
+    # always knows its hub from connector.json — that host serves the
+    # signed manifest and download files.  The pre-pairing fallback
+    # points at the public SaaS so a fresh `curl ... | bash` installer
+    # still has somewhere to fetch from before the customer has run the
+    # pairing step.
     update_base = "https://www.aiterm.io/dl"
     if config_path.exists():
         try:
             cfg = json.loads(config_path.read_text())
             hub_url = cfg.get("hub_url", "")
-            if "aiterm.io" not in hub_url and "127.0.0.1" not in hub_url:
+            if hub_url:
                 from urllib.parse import urlparse
                 parsed = urlparse(hub_url.replace("ws://", "http://").replace("wss://", "https://"))
-                update_base = f"https://{parsed.hostname}/dl"
+                if parsed.hostname:
+                    update_base = f"https://{parsed.hostname}/dl"
         except Exception:
             pass
 
@@ -1079,18 +1197,26 @@ def self_update():
             print(f"  \033[0;31m✗\033[0m {fname}: {e}")
             return 1
 
-    # Restart services if systemd is available
+    # Restart services if systemd is available. Detect system-vs-user mode
+    # from the install_dir path so per-user installs (~/.local/share/aiterm)
+    # don't try to drive system systemd (would polkit-prompt and fail).
     print()
+    if str(install_dir) == "/opt/aiterm" and os.geteuid() == 0:
+        systemctl_cmd = ["systemctl"]
+    else:
+        # Per-user install OR running as the right user — use --user systemd.
+        systemctl_cmd = ["systemctl", "--user"]
     for svc in ["aiterm-connector", "aiterm-pty"]:
         try:
-            r = subprocess.run(["systemctl", "is-active", svc], capture_output=True, text=True, timeout=5)
+            r = subprocess.run(systemctl_cmd + ["is-active", svc],
+                                capture_output=True, text=True, timeout=5)
             if r.stdout.strip() == "active":
-                subprocess.run(["systemctl", "restart", svc], timeout=10)
-                print(f"  \033[0;32m✓\033[0m {svc} neugestartet")
-        except Exception:
-            pass
+                subprocess.run(systemctl_cmd + ["restart", svc], timeout=10)
+                print(f"  \033[0;32m✓\033[0m {svc} restarted")
+        except Exception as e:
+            print(f"  \033[2m· {svc}: restart skipped ({e})\033[0m")
 
-    print("\n  Fertig.\n")
+    print("\n  Update complete.\n")
     return 0
 
 
@@ -1119,4 +1245,15 @@ if __name__ == "__main__":
             except Exception as e:
                 print(f"WARN: could not write connector.json: {e}", flush=True)
         sys.exit(0)
-    asyncio.run(main())
+    # Python 3.6 fallback: asyncio.run() landed in 3.7. Connector ships to old
+    # distros (Rocky 8 default = Python 3.6.8), so use the low-level loop API
+    # on older interpreters.
+    if hasattr(asyncio, "run"):
+        asyncio.run(main())
+    else:
+        _loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(_loop)
+        try:
+            _loop.run_until_complete(main())
+        finally:
+            _loop.close()
