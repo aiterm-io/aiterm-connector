@@ -12,7 +12,7 @@ Usage:
 Requires: pip3 install websockets
 """
 
-CONNECTOR_VERSION = "2026.06.23.1"
+CONNECTOR_VERSION = "2026.06.23.2"
 
 # Ed25519 public key for manifest signature verification. Updates whose
 # manifest.sig does not verify against this key are rejected. Rotation
