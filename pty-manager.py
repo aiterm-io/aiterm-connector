@@ -1666,53 +1666,33 @@ async def main():
 
     await stop
 
-    # Sprint F.1 fix B: graceful shutdown of AI children before tearing
-    # down the manager. Without this, claude children outlive pty-manager
-    # but their auth-token-refresh path gets killed once systemd's CGroup
-    # cleanup hits — Manuel had to /login on every service restart.
-    # New flow: SIGTERM every ai_pid, give them up to 3s total to flush
-    # state, then SIGKILL stragglers, THEN do the existing detach +
-    # server.close. Sessions don't survive the restart anymore (the
-    # detach-survives-update feature is sacrificed for token persistence).
+    # #17 SURVIVAL (Manuel's decision): AI sessions MUST survive a pty-manager
+    # restart/update. The per-session supervisors (session_daemon) are
+    # double-forked + setsid out of our process group, and the systemd unit
+    # runs KillMode=process — so on restart systemd signals ONLY pty-manager,
+    # and the AI children keep running in the service cgroup. We therefore only
+    # DETACH here (close the supervisor sockets); we do NOT signal the AI pids.
+    #
+    # Root cause of the old "/login on every restart": killing the long-running
+    # Claude was itself the bug. Claude refreshes its OAuth token IN-PROCESS;
+    # kill it and nothing refreshes the on-disk token, so the next spawn finds
+    # it expired and forces a re-login. Keeping the process alive keeps the
+    # token fresh. The next pty-manager reattaches via
+    # _reattach_existing_sessions() and the same Claude (same token) continues.
     watcher_task.cancel()
     collision_task.cancel()
     reaper_task.cancel()
-    term_targets = [s for s in sessions.values() if s.pid]
-    for sess in term_targets:
-        try:
-            os.kill(sess.pid, signal.SIGTERM)
-            log.info(f"shutdown: SIGTERM → sid={sess.sid} pid={sess.pid}")
-        except ProcessLookupError:
-            pass
-        except Exception as e:
-            log.warning(f"shutdown SIGTERM sid={sess.sid} failed: {e}")
-    # Total budget across all sessions, polled every 100 ms.
-    SHUTDOWN_BUDGET_S = 3.0
-    deadline = asyncio.get_event_loop().time() + SHUTDOWN_BUDGET_S
-    while asyncio.get_event_loop().time() < deadline:
-        if not any(s.is_alive() for s in term_targets):
-            break
-        await asyncio.sleep(0.1)
-    # Anyone still alive gets the hammer.
-    for sess in term_targets:
-        if sess.is_alive():
-            try:
-                os.kill(sess.pid, signal.SIGKILL)
-                log.warning(f"shutdown: SIGKILL → sid={sess.sid} pid={sess.pid} (didn't exit in {SHUTDOWN_BUDGET_S}s)")
-            except ProcessLookupError:
-                pass
-            except Exception as e:
-                log.warning(f"shutdown SIGKILL sid={sess.sid} failed: {e}")
-    # Drop the supervisor sockets. detach() is idempotent if already done.
+    detached = 0
     for sess in sessions.values():
         try:
             sess.detach()
-        except Exception:
-            pass
+            detached += 1
+        except Exception as e:
+            log.warning(f"shutdown detach sid={sess.sid} failed: {e}")
     server.close()
     if os.path.exists(SOCKET_PATH):
         os.unlink(SOCKET_PATH)
-    log.info("Shutdown — AI children terminated gracefully, sockets closed")
+    log.info(f"Shutdown — detached {detached} session(s) (left running for reattach), sockets closed")
 
 
 if __name__ == "__main__":
