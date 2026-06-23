@@ -83,15 +83,42 @@ def _load_guard_patterns():
     return _GUARD_CACHE
 
 
+GUARD_TIMEOUT_S = 120  # server-side default-deny if no guard decision arrives
+
+
+def _normalize_cmd(line: str) -> str:
+    """De-obfuscate a command line before pattern matching so trivial shell
+    tricks can't slip a dangerous command past the regexes. Defeats:
+      r''m / "r"m / r\\m   → rm        (quote/backslash token splitting)
+      rm${IFS}-rf${IFS}/   → rm -rf /  ($IFS whitespace evasion)
+      line-continuations and collapsed whitespace.
+    This is best-effort de-obfuscation, NOT a shell parser — guard_check
+    matches against BOTH the raw line and this normalized form."""
+    s = line
+    s = re.sub(r"\$\{?IFS\}?(\$[0-9@*])?", " ", s)   # $IFS / ${IFS} / $IFS$9 → space
+    s = s.replace("\\\n", "").replace("\\\r", "")        # line continuations
+    s = s.replace('"', "").replace("'", "")              # r''m / "r"m / 'r'm
+    s = re.sub(r"\\(?=\S)", "", s)                        # r\m → rm
+    s = re.sub(r"\s+", " ", s)                            # collapse whitespace
+    return s.strip()
+
+
 def guard_check(line: str, piloted: bool = False):
     """Return (True, reason) if the command line matches a dangerous pattern,
     else (False, None). When `piloted` is True, also enforce 'piloted'-scope
-    patterns — the bar is stricter when AI drives AI."""
+    patterns — the bar is stricter when AI drives AI. Matches against the raw
+    line AND a de-obfuscated form so quote/$IFS/backslash evasion is caught."""
+    norm = _normalize_cmd(line)
     for rx, reason, _sev, scope in _load_guard_patterns():
         if scope == "piloted" and not piloted:
             continue
-        if rx.search(line):
+        if rx.search(line) or (norm != line and rx.search(norm)):
             return True, reason
+    # Catch-all: an explicit shell-evasion marker ($IFS) that de-obfuscation
+    # resolved but which still matched nothing is itself suspicious in a
+    # piloted (AI-driven) session — flag it rather than pass it silently.
+    if piloted and re.search(r"\$\{?IFS\}?", line):
+        return True, "Obfuscated command uses $IFS to evade inspection."
     return False, None
 
 
@@ -170,6 +197,7 @@ class PtySession:
         self._guard_pending = None
         self._guard_held = b""
         self._guard_cb = None
+        self._guard_timer = None     # server-side default-deny backstop
         # True if any byte of the line currently being assembled arrived from
         # AI-piloted (MCP) input. Piloted lines face the stricter pattern set.
         self._guard_line_piloted = False
@@ -408,6 +436,12 @@ class PtySession:
                             self._guard_cb(line_str, reason)
                         except Exception as e:
                             log.warning(f"guard callback failed: {e}")
+                    # Server-side default-deny backstop: if no decision arrives
+                    # (e.g. the browser tab was closed while the prompt was up),
+                    # auto-deny after the timeout so the session never stays
+                    # wedged and the held command never executes. The browser's
+                    # own 30s countdown normally resolves first.
+                    self._arm_guard_timeout()
                     return
                 # Safe: write terminator, keep scanning remainder
                 self._send_to_pty(b)
@@ -443,8 +477,42 @@ class PtySession:
         if data:
             self._send_to_pty(data)
 
+    def _cancel_guard_timer(self):
+        if self._guard_timer:
+            try:
+                self._guard_timer.cancel()
+            except Exception:
+                pass
+            self._guard_timer = None
+
+    def _arm_guard_timeout(self):
+        self._cancel_guard_timer()
+        try:
+            self._guard_timer = self.loop.call_later(GUARD_TIMEOUT_S, self._guard_timeout)
+        except Exception:
+            self._guard_timer = None
+
+    def _guard_timeout(self):
+        """Backstop fired by the event loop: a pending prompt got no decision
+        in time → default-DENY (audited via a guard_timeout frame upstream)."""
+        self._guard_timer = None
+        if self._guard_pending is None:
+            return
+        held_cmd = self._guard_pending
+        log.warning(f"guard timeout (default-deny) sid={self.sid}: {held_cmd!r}")
+        # Notify upstream so the hub audits it and browsers dismiss the dialog.
+        frame = json.dumps({"t": "guard_timeout", "sid": self.sid,
+                            "cmd": held_cmd[:400]}) + "\n"
+        for w in list(self.clients):
+            try:
+                w.write(frame.encode())
+            except Exception:
+                pass
+        self.guard_resolve(False)
+
     def guard_resolve(self, approve: bool):
         """Called when user responds to a guard_confirm dialog."""
+        self._cancel_guard_timer()
         if self._guard_pending is None:
             return
         self._guard_pending = None
