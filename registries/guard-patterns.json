@@ -1,172 +1,534 @@
 {
-  "version": 1,
-  "updated": "2026-04-25",
+  "version": 2,
+  "updated": "2026-06-23",
   "$comment": [
-    "Guard Mode pattern registry. PTY-Manager loads this on startup and",
-    "re-checks for changes on the AI-registry refresh cycle.",
-    "",
-    "When a new attack vector emerges, add a pattern here, sign, push.",
-    "Customer connectors pick it up on next update \u2014 no code release.",
-    "",
-    "Schema:",
-    "  id          stable identifier",
-    "  regex       Python re-compatible pattern",
-    "  severity    'crit' | 'warn' | 'info'",
-    "  reason      one-line user-facing explanation",
-    "  scope       'always' | 'piloted' (only enforced when session is piloted)",
-    "  ai          optional list of AI ids; omit for all"
+    "Guard Mode pattern registry (Wave 5: expanded by threat category).",
+    "PTY-Manager loads this on startup, re-checks on the registry refresh cycle.",
+    "Add a pattern, sign, push — connectors pick it up on next update, no code release.",
+    "Schema: id, regex (Python re), severity crit|warn|info, reason (one line),",
+    "        scope always|piloted (piloted = only when an AI drives the session),",
+    "        category (threat taxonomy, see docs/guard-coverage.md), ai (optional list)."
   ],
   "patterns": [
     {
       "id": "rm-rf-root",
-      "regex": "rm\\s+(-[rRf]+\\s+)+/(?!\\S)",
+      "regex": "rm\\s+(-[rRfilv]+\\s+)*-[rRfilv]*[rf][rRfilv]*\\s+/(?!\\S)",
       "severity": "crit",
       "reason": "Recursive delete of the root filesystem.",
-      "scope": "always"
+      "scope": "always",
+      "category": "destructive"
     },
     {
       "id": "rm-rf-home",
-      "regex": "rm\\s+(-[rRf]+\\s+)+~(/|$|\\s)",
+      "regex": "rm\\s+(-[rRfilv]+\\s+)+~(/|$|\\s)",
       "severity": "crit",
-      "reason": "Recursive delete of your home directory.",
-      "scope": "always"
+      "reason": "Recursive delete of the home directory.",
+      "scope": "always",
+      "category": "destructive"
     },
     {
-      "id": "curl-pipe-bash",
-      "regex": "curl\\s+[^|]*\\|\\s*(bash|sh|zsh|fish)\\b",
-      "severity": "warn",
-      "reason": "Piping a remote script straight into a shell \u2014 verify the source first.",
-      "scope": "always"
-    },
-    {
-      "id": "wget-pipe-bash",
-      "regex": "wget\\s+[^|]*-O-\\s+[^|]*\\|\\s*(bash|sh)\\b",
-      "severity": "warn",
-      "reason": "Piping a remote script into a shell.",
-      "scope": "always"
+      "id": "rm-rf-star-system",
+      "regex": "rm\\s+(-[rRfilv]+\\s+)+/(etc|usr|var|boot|lib|bin|sbin|root)(/\\S*)?(\\s|$)",
+      "severity": "crit",
+      "reason": "Recursive delete of a system directory.",
+      "scope": "always",
+      "category": "destructive"
     },
     {
       "id": "dd-of-disk",
-      "regex": "\\bdd\\b[^\\n]+of=/dev/(sd|nvme|vd|hd)",
+      "regex": "\\bdd\\b[^\\n]+of=/dev/(sd|nvme|vd|hd|mmcblk|loop|dm-|mapper/|disk/by-)",
       "severity": "crit",
-      "reason": "Direct write to a block device \u2014 destroys the filesystem.",
-      "scope": "always"
+      "reason": "dd writing directly to a block device.",
+      "scope": "always",
+      "category": "destructive"
     },
     {
       "id": "mkfs-disk",
-      "regex": "\\bmkfs(\\.\\w+)?\\s+/dev/",
+      "regex": "\\bmkfs(\\.\\w+)?\\s+[^\\n]*/dev/",
       "severity": "crit",
-      "reason": "Reformatting a disk partition.",
-      "scope": "always"
+      "reason": "Creating a filesystem on a device (data loss).",
+      "scope": "always",
+      "category": "destructive"
+    },
+    {
+      "id": "shred-disk",
+      "regex": "\\bshred\\b[^\\n]+/dev/(sd|nvme|vd|mmcblk|loop|dm-|mapper/)",
+      "severity": "crit",
+      "reason": "Shredding a block device.",
+      "scope": "always",
+      "category": "destructive"
+    },
+    {
+      "id": "wipefs",
+      "regex": "\\bwipefs\\b\\s+[^\\n]*-a",
+      "severity": "crit",
+      "reason": "wipefs -a erases filesystem signatures.",
+      "scope": "always",
+      "category": "destructive"
     },
     {
       "id": "fork-bomb",
       "regex": ":\\s*\\(\\)\\s*\\{\\s*:\\|:&\\s*\\}\\s*;:",
       "severity": "crit",
       "reason": "Classic fork bomb.",
-      "scope": "always"
+      "scope": "always",
+      "category": "destructive"
     },
     {
       "id": "chmod-777-recursive",
       "regex": "chmod\\s+(-R\\s+)?7[0-7][0-7]\\s+/",
       "severity": "warn",
-      "reason": "World-writable on a system path \u2014 opens privilege escalation paths.",
-      "scope": "always"
+      "reason": "World-writable recursive chmod on an absolute path.",
+      "scope": "always",
+      "category": "destructive"
     },
     {
-      "id": "shred-disk",
-      "regex": "shred\\s+[^\\n]+/dev/(sd|nvme|vd)",
+      "id": "overwrite-blockdev",
+      "regex": ">\\s*/dev/(sd|nvme|vd|mmcblk|mapper/)",
       "severity": "crit",
-      "reason": "Cryptographic disk wipe \u2014 irreversible.",
-      "scope": "always"
+      "reason": "Redirecting output onto a block device.",
+      "scope": "always",
+      "category": "destructive"
     },
     {
-      "id": "$comment-piloted-block",
-      "_doc": "Patterns below only enforce when the session is piloted (Pilot Mode). The bar is higher when AI drives AI."
-    },
-    {
-      "id": "sudo-anything",
-      "regex": "(^|\\s|;|&&|\\|\\|)sudo\\s+",
-      "severity": "warn",
-      "reason": "Privilege escalation via sudo \u2014 confirm intent in piloted sessions.",
-      "scope": "piloted"
-    },
-    {
-      "id": "chown-system",
-      "regex": "chown\\s+(-R\\s+)?\\S+\\s+/(etc|usr|var|lib|root)",
-      "severity": "warn",
-      "reason": "Ownership change on a system directory.",
-      "scope": "piloted"
-    },
-    {
-      "id": "setuid",
-      "regex": "chmod\\s+([0-9]*[24-7][0-7][0-7][0-7]|[+]s\\b)",
-      "severity": "warn",
-      "reason": "Setting setuid/setgid bits.",
-      "scope": "piloted"
-    },
-    {
-      "id": "authorized-keys-append",
-      "regex": ">>\\s*[\"']?([~/]|/root|/home/\\S+)\\.ssh/authorized_keys",
+      "id": "read-shadow",
+      "regex": "(cat|less|more|head|tail|cp|scp|vi|vim|nano|strings|xxd|base64)\\s+[^\\n]*/etc/(shadow|gshadow)\\b",
       "severity": "crit",
-      "reason": "Adding an SSH key \u2014 establishing remote access.",
-      "scope": "piloted"
+      "reason": "Reading the shadow password file.",
+      "scope": "always",
+      "category": "credential-read"
     },
     {
-      "id": "crontab-direct",
-      "regex": "(crontab\\s+(-e|-l)|>\\s*/etc/cron|/etc/cron\\.d/)",
-      "severity": "warn",
-      "reason": "Cron edit \u2014 persistence mechanism.",
-      "scope": "piloted"
+      "id": "read-ssh-privkey",
+      "regex": "(cat|less|more|head|tail|cp|scp|base64|xxd|strings)\\s+[^\\n]*(/\\.ssh/|/\\.ssh/)?id_(rsa|ed25519|ecdsa|dsa)\\b(?!\\.pub)",
+      "severity": "crit",
+      "reason": "Reading an SSH private key.",
+      "scope": "piloted",
+      "category": "credential-read"
     },
     {
-      "id": "systemd-unit-write",
-      "regex": ">\\s*(/etc|/usr/lib)/systemd/system/[^\\s]+\\.(service|timer|socket)",
+      "id": "read-cloud-creds",
+      "regex": "(cat|less|cp|scp|base64|xxd|tar)\\s+[^\\n]*(\\.aws/credentials|\\.config/gcloud|\\.kube/config|\\.azure/|\\.docker/config\\.json)",
+      "severity": "crit",
+      "reason": "Reading cloud/credential config.",
+      "scope": "piloted",
+      "category": "credential-read"
+    },
+    {
+      "id": "read-dotenv",
+      "regex": "(cat|less|cp|scp|base64|curl\\s+[^\\n]*-T)\\s+[^\\n]*(/\\.env\\b|\\.env\\.|\\.git-credentials|\\.netrc|\\.npmrc|\\.pgpass)",
       "severity": "warn",
-      "reason": "Writing a systemd unit \u2014 persistence + privilege.",
-      "scope": "piloted"
+      "reason": "Reading a secrets/credentials dotfile.",
+      "scope": "piloted",
+      "category": "credential-read"
+    },
+    {
+      "id": "env-dump-pipe",
+      "regex": "\\b(env|printenv|set)\\b[^\\n|]*\\|\\s*(curl|nc|wget|base64|xargs\\s+curl)",
+      "severity": "crit",
+      "reason": "Dumping environment variables to the network.",
+      "scope": "piloted",
+      "category": "credential-read"
+    },
+    {
+      "id": "curl-upload",
+      "regex": "\\bcurl\\b[^\\n]*\\s(-T|--upload-file|--data-binary\\s+@|-d\\s+@|-F\\s+\\S*@)\\s*\\S",
+      "severity": "warn",
+      "reason": "curl uploading a local file outward.",
+      "scope": "piloted",
+      "category": "exfiltration"
+    },
+    {
+      "id": "scp-rsync-out",
+      "regex": "\\b(scp|rsync)\\b\\s+[^\\n]*\\s\\S+@[\\w.\\-]+:",
+      "severity": "warn",
+      "reason": "scp/rsync copying to a remote host.",
+      "scope": "piloted",
+      "category": "exfiltration"
+    },
+    {
+      "id": "tar-pipe-net",
+      "regex": "\\btar\\b[^\\n|]*\\|\\s*(nc|ncat|socat|curl|openssl\\s+s_client)\\b",
+      "severity": "crit",
+      "reason": "Archiving and piping data to the network.",
+      "scope": "piloted",
+      "category": "exfiltration"
+    },
+    {
+      "id": "dns-exfil",
+      "regex": "\\b(dig|nslookup|host)\\b\\s+[^\\n]*\\$\\(",
+      "severity": "warn",
+      "reason": "DNS query with command-substituted data (possible exfil).",
+      "scope": "piloted",
+      "category": "exfiltration"
     },
     {
       "id": "reverse-shell-nc",
-      "regex": "nc\\s+(-[a-zA-Z]*e\\s+|.*-c\\s+/bin/(ba)?sh)",
+      "regex": "\\bn(c|cat)\\s+(-[a-zA-Z]*e\\s+|[^\\n]*-c\\s+/bin/(ba|z)?sh)",
       "severity": "crit",
-      "reason": "Classic netcat reverse shell pattern.",
-      "scope": "always"
+      "reason": "Netcat reverse/bind shell.",
+      "scope": "always",
+      "category": "reverse-shell"
     },
     {
-      "id": "reverse-shell-bash",
-      "regex": "bash\\s+-i\\s+>&\\s*/dev/tcp/",
+      "id": "reverse-shell-devtcp",
+      "regex": "(ba|z)?sh\\s+-i\\s*[0-9]*>&?\\s*/dev/(tcp|udp)/",
       "severity": "crit",
-      "reason": "Bash reverse shell via /dev/tcp.",
-      "scope": "always"
+      "reason": "Shell redirected to /dev/tcp (reverse shell).",
+      "scope": "always",
+      "category": "reverse-shell"
     },
     {
-      "id": "iptables-flush",
-      "regex": "iptables\\s+-F",
-      "severity": "warn",
-      "reason": "Flushing all firewall rules.",
-      "scope": "piloted"
+      "id": "reverse-shell-python",
+      "regex": "python[0-9.]*\\s+-c\\s+[^\\n]*(socket|pty\\.spawn|os\\.dup2)",
+      "severity": "crit",
+      "reason": "Python one-liner reverse shell.",
+      "scope": "always",
+      "category": "reverse-shell"
     },
     {
-      "id": "ufw-disable",
-      "regex": "ufw\\s+disable",
+      "id": "reverse-shell-perlphpruby",
+      "regex": "\\b(perl|php|ruby)\\b\\s+-[er]\\s+[^\\n]*(socket|fsockopen|Socket|IO::Socket)",
+      "severity": "crit",
+      "reason": "Perl/PHP/Ruby reverse shell.",
+      "scope": "always",
+      "category": "reverse-shell"
+    },
+    {
+      "id": "reverse-shell-socat",
+      "regex": "\\bsocat\\b\\s+[^\\n]*(exec:|system:)[^\\n]*(sh|bash)",
+      "severity": "crit",
+      "reason": "socat spawning a shell to a peer.",
+      "scope": "always",
+      "category": "reverse-shell"
+    },
+    {
+      "id": "mkfifo-shell",
+      "regex": "\\bmkfifo\\b[^\\n]+;[^\\n]*(nc|ncat|/dev/tcp)",
+      "severity": "crit",
+      "reason": "Named-pipe reverse shell.",
+      "scope": "always",
+      "category": "reverse-shell"
+    },
+    {
+      "id": "curl-pipe-shell",
+      "regex": "\\b(curl|wget|fetch)\\b[^\\n|]*\\|\\s*(sudo\\s+)?(ba|z)?sh\\b",
       "severity": "warn",
-      "reason": "Disabling the UFW firewall.",
-      "scope": "piloted"
+      "reason": "Piping a remote script straight into a shell.",
+      "scope": "always",
+      "category": "package-exec"
+    },
+    {
+      "id": "process-sub-shell",
+      "regex": "\\b(ba|z)?sh\\b\\s+<\\(\\s*(curl|wget)",
+      "severity": "warn",
+      "reason": "Executing a remote script via process substitution.",
+      "scope": "always",
+      "category": "package-exec"
+    },
+    {
+      "id": "pip-install-url",
+      "regex": "pip[0-9.]*\\s+install\\s+[^\\n]*(https?://|git\\+|\\.git\\b)",
+      "severity": "warn",
+      "reason": "pip installing from a URL/VCS (arbitrary code).",
+      "scope": "piloted",
+      "category": "package-exec"
+    },
+    {
+      "id": "npm-install-url",
+      "regex": "npm\\s+(i|install|exec)\\s+[^\\n]*(https?://|git\\+|github:)",
+      "severity": "warn",
+      "reason": "npm installing from a URL/VCS.",
+      "scope": "piloted",
+      "category": "package-exec"
+    },
+    {
+      "id": "gem-curl-install",
+      "regex": "\\bgem\\s+install\\s+[^\\n]*--source\\s+http",
+      "severity": "warn",
+      "reason": "gem installing from an arbitrary source.",
+      "scope": "piloted",
+      "category": "package-exec"
+    },
+    {
+      "id": "docker-privileged",
+      "regex": "docker\\s+(run|create)\\s+[^\\n]*--privileged",
+      "severity": "crit",
+      "reason": "Privileged container (host escape).",
+      "scope": "piloted",
+      "category": "container-escape"
+    },
+    {
+      "id": "docker-mount-root",
+      "regex": "docker\\s+(run|create)\\s+[^\\n]*-v\\s+/(:|(etc|root|var|usr|lib|boot|home)(/\\S*)?:)",
+      "severity": "crit",
+      "reason": "Mounting a host system path into a container.",
+      "scope": "piloted",
+      "category": "container-escape"
+    },
+    {
+      "id": "docker-pid-host",
+      "regex": "docker\\s+(run|create)\\s+[^\\n]*--(pid|net|ipc)=host",
+      "severity": "warn",
+      "reason": "Container sharing host namespaces.",
+      "scope": "piloted",
+      "category": "container-escape"
+    },
+    {
+      "id": "kubectl-exec",
+      "regex": "kubectl\\s+(exec|cp|run)\\b",
+      "severity": "warn",
+      "reason": "kubectl exec/cp/run into a cluster workload.",
+      "scope": "piloted",
+      "category": "container-escape"
+    },
+    {
+      "id": "nsenter-host",
+      "regex": "\\bnsenter\\b\\s+[^\\n]*(-t\\s+1\\b|--target\\s+1\\b|-m\\b)",
+      "severity": "crit",
+      "reason": "nsenter into the host/init namespace.",
+      "scope": "piloted",
+      "category": "container-escape"
+    },
+    {
+      "id": "aws-s3-rm",
+      "regex": "aws\\s+s3\\s+(rm|rb)\\s+[^\\n]*(--recursive|s3://)",
+      "severity": "crit",
+      "reason": "Recursive S3 delete.",
+      "scope": "piloted",
+      "category": "cloud-destructive"
+    },
+    {
+      "id": "aws-terminate",
+      "regex": "aws\\s+ec2\\s+terminate-instances",
+      "severity": "crit",
+      "reason": "Terminating EC2 instances.",
+      "scope": "piloted",
+      "category": "cloud-destructive"
+    },
+    {
+      "id": "terraform-destroy",
+      "regex": "terraform\\s+(destroy|apply)\\s+[^\\n]*(-auto-approve|destroy)",
+      "severity": "crit",
+      "reason": "terraform destroy / auto-approved apply.",
+      "scope": "piloted",
+      "category": "cloud-destructive"
+    },
+    {
+      "id": "gcloud-delete",
+      "regex": "gcloud\\s+[^\\n]*\\bdelete\\b",
+      "severity": "warn",
+      "reason": "gcloud resource deletion.",
+      "scope": "piloted",
+      "category": "cloud-destructive"
+    },
+    {
+      "id": "kubectl-delete",
+      "regex": "kubectl\\s+delete\\s+[^\\n]*(--all|-A\\b|namespace)",
+      "severity": "crit",
+      "reason": "Bulk kubectl delete.",
+      "scope": "piloted",
+      "category": "cloud-destructive"
+    },
+    {
+      "id": "insmod-modprobe",
+      "regex": "\\b(insmod|modprobe|rmmod)\\b\\s+\\S",
+      "severity": "warn",
+      "reason": "Loading/unloading a kernel module.",
+      "scope": "piloted",
+      "category": "kernel-module"
+    },
+    {
+      "id": "sysctl-write",
+      "regex": "\\bsysctl\\s+(-w\\s+|\\S+=)",
+      "severity": "warn",
+      "reason": "Writing a kernel tunable.",
+      "scope": "piloted",
+      "category": "kernel-module"
+    },
+    {
+      "id": "proc-sys-write",
+      "regex": ">\\s*/proc/sys/",
+      "severity": "warn",
+      "reason": "Writing directly to /proc/sys.",
+      "scope": "piloted",
+      "category": "kernel-module"
+    },
+    {
+      "id": "user-create",
+      "regex": "\\b(useradd|adduser|usermod\\s+[^\\n]*-G\\s+(sudo|wheel|admin))\\b",
+      "severity": "warn",
+      "reason": "Creating a user or granting admin group.",
+      "scope": "piloted",
+      "category": "user-account"
+    },
+    {
+      "id": "passwd-change",
+      "regex": "\\bpasswd\\b\\s+\\S",
+      "severity": "warn",
+      "reason": "Changing an account password.",
+      "scope": "piloted",
+      "category": "user-account"
+    },
+    {
+      "id": "sudoers-edit",
+      "regex": "(>>?\\s*/etc/sudoers|visudo|/etc/sudoers\\.d/)",
+      "severity": "crit",
+      "reason": "Editing the sudoers policy.",
+      "scope": "piloted",
+      "category": "user-account"
+    },
+    {
+      "id": "authorized-keys-append",
+      "regex": ">>?\\s*[\\\"']?([~/]|/root|/home/\\S+)[^\\n]*\\.ssh/authorized_keys",
+      "severity": "crit",
+      "reason": "Adding an SSH authorized key.",
+      "scope": "piloted",
+      "category": "persistence"
+    },
+    {
+      "id": "crontab-persist",
+      "regex": "(crontab\\s+(-e|-l|\\S+)|>\\s*/etc/cron|/etc/cron\\.(d|daily|hourly)/)",
+      "severity": "warn",
+      "reason": "Cron-based persistence.",
+      "scope": "piloted",
+      "category": "persistence"
+    },
+    {
+      "id": "systemd-unit-write",
+      "regex": ">\\s*(/etc|/usr/lib|/run)/systemd/system/\\S+\\.(service|timer|socket)",
+      "severity": "warn",
+      "reason": "Writing a systemd unit.",
+      "scope": "piloted",
+      "category": "persistence"
+    },
+    {
+      "id": "shell-rc-append",
+      "regex": ">>\\s*[\\\"']?(~|/root|/home/\\S+)[^\\n]*/\\.(bashrc|bash_profile|profile|zshrc|zprofile)\\b",
+      "severity": "warn",
+      "reason": "Appending to a shell startup file.",
+      "scope": "piloted",
+      "category": "persistence"
+    },
+    {
+      "id": "ld-preload",
+      "regex": "(>\\s*/etc/ld\\.so\\.preload|\\bLD_PRELOAD=)",
+      "severity": "crit",
+      "reason": "LD_PRELOAD / ld.so.preload hijack.",
+      "scope": "piloted",
+      "category": "persistence"
+    },
+    {
+      "id": "rc-local",
+      "regex": ">>?\\s*/etc/(rc\\.local|rc\\.d/)",
+      "severity": "warn",
+      "reason": "Boot-time rc.local persistence.",
+      "scope": "piloted",
+      "category": "persistence"
     },
     {
       "id": "history-clear",
-      "regex": "(history\\s+-c|>\\s*~/\\.bash_history|>\\s*\\$HISTFILE)",
+      "regex": "(history\\s+-c|>\\s*~?/?\\.bash_history|>\\s*\\$HISTFILE|unset\\s+HISTFILE)",
       "severity": "warn",
-      "reason": "Clearing shell history \u2014 anti-forensic.",
-      "scope": "piloted"
+      "reason": "Clearing shell history.",
+      "scope": "piloted",
+      "category": "log-tampering"
+    },
+    {
+      "id": "truncate-logs",
+      "regex": "(>\\s*/var/log/|\\btruncate\\b[^\\n]*/var/log/|\\brm\\b[^\\n]*/var/log/)",
+      "severity": "warn",
+      "reason": "Truncating or deleting system logs.",
+      "scope": "piloted",
+      "category": "log-tampering"
+    },
+    {
+      "id": "journal-vacuum",
+      "regex": "journalctl\\s+[^\\n]*--vacuum",
+      "severity": "warn",
+      "reason": "Vacuuming the systemd journal.",
+      "scope": "piloted",
+      "category": "log-tampering"
+    },
+    {
+      "id": "iptables-flush",
+      "regex": "\\biptables\\s+(-F|-X|--flush)",
+      "severity": "warn",
+      "reason": "Flushing iptables rules.",
+      "scope": "piloted",
+      "category": "firewall"
+    },
+    {
+      "id": "nft-flush",
+      "regex": "\\bnft\\s+flush\\s+ruleset",
+      "severity": "warn",
+      "reason": "Flushing the nftables ruleset.",
+      "scope": "piloted",
+      "category": "firewall"
+    },
+    {
+      "id": "ufw-disable",
+      "regex": "\\b(ufw\\s+disable|firewall-cmd\\s+[^\\n]*--(stop|disable))",
+      "severity": "warn",
+      "reason": "Disabling the firewall.",
+      "scope": "piloted",
+      "category": "firewall"
+    },
+    {
+      "id": "sudo-anything",
+      "regex": "(^|\\s|;|&&|\\|\\|)sudo\\s+\\S",
+      "severity": "warn",
+      "reason": "Privilege escalation via sudo — confirm intent in piloted sessions.",
+      "scope": "piloted",
+      "category": "privesc"
+    },
+    {
+      "id": "chown-system",
+      "regex": "chown\\s+(-R\\s+)?\\S+\\s+/(etc|usr|var|lib|root|boot)\\b",
+      "severity": "warn",
+      "reason": "Ownership change on a system directory.",
+      "scope": "piloted",
+      "category": "privesc"
+    },
+    {
+      "id": "setuid-bit",
+      "regex": "chmod\\s+([0-7]?[24-7][0-7][0-7][0-7]\\b|[ugo]*[+]s\\b)",
+      "severity": "warn",
+      "reason": "Setting a setuid/setgid bit.",
+      "scope": "piloted",
+      "category": "privesc"
+    },
+    {
+      "id": "base64-decode-exec",
+      "regex": "base64\\s+(-d|--decode)[^\\n|]*\\|\\s*(ba|z)?sh",
+      "severity": "crit",
+      "reason": "Decoding base64 straight into a shell.",
+      "scope": "always",
+      "category": "obfuscation"
+    },
+    {
+      "id": "echo-decode-exec",
+      "regex": "\\becho\\s+[A-Za-z0-9+/=]{24,}\\s*\\|\\s*base64",
+      "severity": "warn",
+      "reason": "Piping a base64 blob into base64 (likely decode-exec).",
+      "scope": "always",
+      "category": "obfuscation"
+    },
+    {
+      "id": "eval-cmdsub",
+      "regex": "\\beval\\s+[\\\"']?\\$\\(",
+      "severity": "warn",
+      "reason": "eval of a command substitution.",
+      "scope": "piloted",
+      "category": "obfuscation"
     },
     {
       "id": "package-key-add",
       "regex": "(apt-key\\s+add|gpg\\s+--import|trust-keys)",
       "severity": "warn",
-      "reason": "Adding a package-signing key \u2014 supply-chain attack vector.",
-      "scope": "piloted"
+      "reason": "Importing a package-signing key.",
+      "scope": "piloted",
+      "category": "package-exec"
     }
   ]
 }
