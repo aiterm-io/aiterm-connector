@@ -12,7 +12,7 @@ Usage:
 Requires: pip3 install websockets
 """
 
-CONNECTOR_VERSION = "2026.06.23.2"
+CONNECTOR_VERSION = "2026.06.24.1"
 
 # Ed25519 public key for manifest signature verification. Updates whose
 # manifest.sig does not verify against this key are rejected. Rotation
@@ -1222,6 +1222,7 @@ def self_update():
         ("ai-registry.json", install_dir / "ai-registry.json"),
         ("guard-patterns.json", install_dir / "guard-patterns.json"),
         ("doctor-checks.json", install_dir / "doctor-checks.json"),
+        ("osc133.bash", install_dir / "osc133.bash"),
         ("aiterm", bin_dir / "aiterm"),
     ]
 
