@@ -201,6 +201,15 @@ class PtySession:
         # True if any byte of the line currently being assembled arrived from
         # AI-piloted (MCP) input. Piloted lines face the stricter pattern set.
         self._guard_line_piloted = False
+        # OSC-133 deterministic shell-state (bash sessions). nonce-tagged markers
+        # (C=working, B/D=idle) injected via osc133.bash; parsed from raw output.
+        self._osc133_nonce = None
+        self._osc133_re = None
+        self._osc_buf = b""
+        self._osc133_state = None      # 'working' | 'idle' | None
+        self._osc133_live_A = False    # seen a prompt-start/end marker
+        self._osc133_live_D = False    # seen a command-done marker (liveness)
+        self._ai_state_cb = None       # set by handle_client to push upstream
 
     @property
     def _is_bash(self):
@@ -246,6 +255,19 @@ class PtySession:
         env["AITERM_STARTED_AT"] = str(int(self.started_at))
 
         argv = [self.cmd] + self.cmd_args
+        # OSC-133 deterministic prompt markers for bash sessions: load a
+        # hermetic rcfile (it sources the user's own config first) that emits
+        # nonce-tagged C/B/D markers. The nonce travels in the env; only
+        # nonce-tagged markers are honoured, so a command's output can't spoof
+        # an "idle" and trick hands-free read-aloud into opening the mic.
+        _osc_rc = os.path.join(str(BASE_DIR), "osc133.bash")
+        if os.path.basename(self.cmd or "") == "bash" and os.path.exists(_osc_rc):
+            import secrets as _secrets
+            self._osc133_nonce = _secrets.token_hex(8)
+            self._osc133_re = re.compile(
+                rb"\x1b\]133;([ABCD]);aiterm=" + self._osc133_nonce.encode() + rb"(?:;-?[0-9]+)?\x07")
+            env["AITERM_OSC133_NONCE"] = self._osc133_nonce
+            argv = [self.cmd, "--rcfile", _osc_rc, "-i"] + self.cmd_args
         # Fork supervisor + AI; daemon hands us back the AI PID and the
         # path of the supervisor's listen-socket.
         try:
@@ -588,8 +610,43 @@ class PtySession:
                 self.scrollback.extend(body)
                 if len(self.scrollback) > SCROLLBACK_MAX:
                     self.scrollback = self.scrollback[-SCROLLBACK_MAX:]
+                if self._osc133_re is not None:
+                    self._scan_osc133(body)
                 asyncio.ensure_future(self._broadcast(body))
             # T_META_RESP and others: ignored here; reattach() handles those.
+
+    def _scan_osc133(self, body):
+        """Parse nonce-tagged OSC-133 markers out of the raw output stream and
+        emit a deterministic shell-state (working/idle) on transitions. Markers
+        may straddle chunk boundaries, so we keep a short rolling buffer."""
+        self._osc_buf += body
+        if len(self._osc_buf) > 4096:           # cap; a marker is ~40 bytes
+            self._osc_buf = self._osc_buf[-256:]
+        last_end = 0
+        new_state = None
+        for m in self._osc133_re.finditer(self._osc_buf):
+            last_end = m.end()
+            mk = m.group(1)
+            if mk in (b"A", b"B"):
+                self._osc133_live_A = True
+            if mk == b"C":
+                new_state = "working"
+            elif mk in (b"B", b"D"):
+                new_state = "idle"
+            if mk == b"D":
+                self._osc133_live_D = True
+        if last_end:
+            self._osc_buf = self._osc_buf[last_end:]
+        # Only trust + emit once the full prompt cycle has been observed
+        # (a prompt marker AND a command-done marker) — guards against a
+        # half-initialised shell or a spoof that only emits one marker type.
+        if new_state and new_state != self._osc133_state:
+            self._osc133_state = new_state
+            if self._osc133_live_A and self._osc133_live_D and self._ai_state_cb:
+                try:
+                    self._ai_state_cb(self.sid, new_state)
+                except Exception as e:
+                    log.warning(f"ai_state cb failed: {e}")
 
     def _handle_supervisor_gone(self):
         """Supervisor socket closed → AI exited. Clean up reader, mark dead."""
@@ -983,6 +1040,20 @@ async def handle_client(reader, writer):
                                 pass
                     return _cb
                 sess._guard_cb = _make_guard_cb(sid, sess)
+
+                # Push deterministic OSC-133 shell-state upstream (→ hub →
+                # browser driving classifier). Same fan-out as guard_confirm.
+                def _make_ai_state_cb(bound_sess):
+                    def _cb(bound_sid, state):
+                        payload = json.dumps({"t": "ai_state", "sid": bound_sid,
+                                              "state": state, "src": "osc133"}) + "\n"
+                        for w in list(bound_sess.clients):
+                            try:
+                                w.write(payload.encode())
+                            except Exception:
+                                pass
+                    return _cb
+                sess._ai_state_cb = _make_ai_state_cb(sess)
 
                 sess.spawn()
                 sessions[sid] = sess
