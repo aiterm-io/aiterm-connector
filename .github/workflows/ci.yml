@@ -37,6 +37,9 @@ jobs:
         with:
           scandir: '.'
           severity: warning
+          # zsh/fish shell-integration files are not POSIX/bash — shellcheck
+          # cannot parse them. They are validated by their own interpreters.
+          ignore_names: osc133.zsh osc133.fish
       - name: Syntax check aiterm CLI
         run: bash -n aiterm
 
