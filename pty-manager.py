@@ -241,6 +241,43 @@ class PtySession:
         self.sock_path = sock_path
         self.loop.add_reader(self.fd, self._on_socket)
 
+    def _osc133_setup(self, shell, base):
+        """Return {'argv':[...], 'env':{...}} to launch `shell` with hermetic
+        OSC-133 integration, or None if unsupported/missing. bash uses
+        --rcfile, fish uses -C source, zsh uses a ZDOTDIR whose .zshrc symlinks
+        the shipped integration (so the shipped file stays the single source)."""
+        if shell == "bash":
+            rc = os.path.join(base, "osc133.bash")
+            if not os.path.exists(rc):
+                return None
+            return {"argv": [self.cmd, "--rcfile", rc, "-i"], "env": {}}
+        if shell == "fish":
+            f = os.path.join(base, "osc133.fish")
+            if not os.path.exists(f):
+                return None
+            return {"argv": [self.cmd, "-i", "-C", "source " + f], "env": {}}
+        if shell == "zsh":
+            zsrc = os.path.join(base, "osc133.zsh")
+            if not os.path.exists(zsrc):
+                return None
+            zdir = os.path.join(base, ".osc133-zsh")
+            try:
+                os.makedirs(zdir, exist_ok=True)
+                link = os.path.join(zdir, ".zshrc")
+                if not (os.path.islink(link) and os.path.realpath(link) == os.path.realpath(zsrc)):
+                    if os.path.lexists(link):
+                        os.remove(link)
+                    os.symlink(zsrc, link)
+            except OSError as e:
+                log.warning(f"osc133 zsh setup failed: {e}")
+                return None
+            env = {"ZDOTDIR": zdir}
+            orig = os.environ.get("ZDOTDIR")
+            if orig:
+                env["AITERM_ZDOTDIR_ORIG"] = orig
+            return {"argv": [self.cmd, "-i"], "env": env}
+        return None
+
     def spawn(self):
         self.kill()
         import time as _time
@@ -255,19 +292,21 @@ class PtySession:
         env["AITERM_STARTED_AT"] = str(int(self.started_at))
 
         argv = [self.cmd] + self.cmd_args
-        # OSC-133 deterministic prompt markers for bash sessions: load a
-        # hermetic rcfile (it sources the user's own config first) that emits
-        # nonce-tagged C/B/D markers. The nonce travels in the env; only
-        # nonce-tagged markers are honoured, so a command's output can't spoof
-        # an "idle" and trick hands-free read-aloud into opening the mic.
-        _osc_rc = os.path.join(str(BASE_DIR), "osc133.bash")
-        if os.path.basename(self.cmd or "") == "bash" and os.path.exists(_osc_rc):
+        # OSC-133 deterministic prompt markers (bash/zsh/fish): load a hermetic
+        # integration (it sources the user's own config first) that emits
+        # nonce-tagged C/B/D markers. Only nonce-tagged markers are honoured, so
+        # a command's output can't spoof an "idle" and trick hands-free
+        # read-aloud into opening the mic. Falls back to heuristics if absent.
+        _osc = self._osc133_setup(os.path.basename(self.cmd or ""), str(BASE_DIR))
+        if _osc:
             import secrets as _secrets
             self._osc133_nonce = _secrets.token_hex(8)
             self._osc133_re = re.compile(
                 rb"\x1b\]133;([ABCD]);aiterm=" + self._osc133_nonce.encode() + rb"(?:;-?[0-9]+)?\x07")
             env["AITERM_OSC133_NONCE"] = self._osc133_nonce
-            argv = [self.cmd, "--rcfile", _osc_rc, "-i"] + self.cmd_args
+            for _k, _v in _osc.get("env", {}).items():
+                env[_k] = _v
+            argv = _osc["argv"] + self.cmd_args
         # Fork supervisor + AI; daemon hands us back the AI PID and the
         # path of the supervisor's listen-socket.
         try:
@@ -637,12 +676,13 @@ class PtySession:
                 self._osc133_live_D = True
         if last_end:
             self._osc_buf = self._osc_buf[last_end:]
-        # Only trust + emit once the full prompt cycle has been observed
-        # (a prompt marker AND a command-done marker) — guards against a
-        # half-initialised shell or a spoof that only emits one marker type.
+        # Only trust + emit once a command-done (D) marker has been seen — that
+        # proves the (nonce-validated) integration is actually emitting. Gating
+        # on D alone (not also A/B) is robust against prompt themes that rewrite
+        # PS1 and drop the A/B markers; D comes from the precmd hook either way.
         if new_state and new_state != self._osc133_state:
             self._osc133_state = new_state
-            if self._osc133_live_A and self._osc133_live_D and self._ai_state_cb:
+            if self._osc133_live_D and self._ai_state_cb:
                 try:
                     self._ai_state_cb(self.sid, new_state)
                 except Exception as e:
